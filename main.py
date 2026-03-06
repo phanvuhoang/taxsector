@@ -9,7 +9,7 @@ from typing import AsyncGenerator
 import anthropic
 import httpx
 from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, FileResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from docx import Document
 from docx.shared import RGBColor
@@ -49,7 +49,10 @@ SECTOR_SECTIONS = [
     {"id": "s5", "title": "Phan tich cac loai thue ap dung",
      "sub": ["Thue TNDN", "Thue GTGT", "Thue Nha thau", "Thue TTDB", "Thue XNK", "Phi & le phi"], "enabled": True},
     {"id": "s6", "title": "Cac van de thue dac thu cua nganh",
-     "sub": ["Rui ro doanh thu/chi phi", "Chuyen gia", "Uu dai thue", "Hoa don dac thu", "Khau tru thue"], "enabled": True},
+     "sub": ["Rui ro doanh thu/chi phi", "Chuyen gia", "Uu dai thue",
+             "Hoa don dac thu", "Khau tru thue",
+             "Tranh chap thue & an le",
+             "Cong van/huong dan dac thu Tong cuc Thue cho nganh"], "enabled": True},
     {"id": "s7", "title": "Thong le & van de thue quoc te",
      "sub": ["BEPS", "Chuyen gia quoc te", "So sanh voi khu vuc", "Hiep dinh thue"], "enabled": True},
 ]
@@ -66,7 +69,15 @@ SECTOR_SECTIONS_VI = [
     {"id": "s5", "title": "Phân tích các loại thuế áp dụng",
      "sub": ["Thuế TNDN", "Thuế GTGT", "Thuế Nhà thầu", "Thuế TTĐB", "Thuế XNK", "Phí & lệ phí"], "enabled": True},
     {"id": "s6", "title": "Các vấn đề thuế đặc thù của ngành",
-     "sub": ["Rủi ro doanh thu/chi phí", "Chuyển giá", "Ưu đãi thuế", "Hóa đơn đặc thù", "Khấu trừ thuế"], "enabled": True},
+     "sub": [
+         "Rủi ro doanh thu/chi phí",
+         "Chuyển giá",
+         "Ưu đãi thuế",
+         "Hóa đơn đặc thù",
+         "Khấu trừ thuế",
+         "Tranh chấp thuế & án lệ",
+         "Công văn/hướng dẫn đặc thù của Tổng cục Thuế cho ngành",
+     ], "enabled": True},
     {"id": "s7", "title": "Thông lệ & vấn đề thuế quốc tế",
      "sub": ["BEPS", "Chuyển giá quốc tế", "So sánh với khu vực", "Hiệp định thuế"], "enabled": True},
 ]
@@ -79,20 +90,35 @@ COMPANY_SECTIONS_VI = [
     {"id": "c3", "title": "Phân tích tài chính & thuế",
      "sub": ["Doanh thu & lợi nhuận", "Gánh nặng thuế", "Tỷ lệ thuế hiệu quả", "So sánh ngành"], "enabled": True},
     {"id": "c4", "title": "Rủi ro thuế đặc thù",
-     "sub": ["Rủi ro thanh tra", "Chuyển giá", "Cấu trúc pháp lý", "Giao dịch liên kết"], "enabled": True},
+     "sub": [
+         "Rủi ro thanh tra",
+         "Chuyển giá",
+         "Cấu trúc pháp lý",
+         "Giao dịch liên kết",
+         "Tranh chấp thuế & lịch sử thanh/kiểm tra",
+         "Công văn/ruling đặc thù áp dụng cho công ty/ngành",
+     ], "enabled": True},
     {"id": "c5", "title": "Khuyến nghị",
      "sub": ["Tối ưu hóa thuế", "Tuân thủ", "Cơ hội ưu đãi", "Rủi ro cần theo dõi"], "enabled": True},
 ]
 
 # ── Research: Perplexity ──────────────────────────────────────────────────────
 def build_query(section: dict, subject: str, mode: str) -> str:
+    current_year = datetime.now().year
     mode_ctx = "ngành" if mode == "sector" else "công ty"
     subs = ", ".join(section.get("sub", []))
+    is_legal = any(k in section.get("title", "").lower() for k in ["pháp lý", "luật", "quy định", "thuế", "thue"])
+    legal_note = (
+        f"\nLƯU Ý QUAN TRỌNG: Chỉ trích dẫn văn bản pháp luật CÒN HIỆU LỰC tính đến {current_year}. "
+        f"Nếu có Luật/Nghị định/Thông tư mới thay thế → bắt buộc dùng văn bản MỚI NHẤT. "
+        f"Ghi rõ văn bản nào thay thế văn bản nào."
+    ) if is_legal else ""
     return (
-        f"Nghiên cứu chuyên sâu về: {section['title']} — {mode_ctx} {subject} tại Việt Nam năm 2024-2025\n"
+        f"Nghiên cứu chuyên sâu về: {section['title']} — {mode_ctx} {subject} tại Việt Nam năm {current_year}\n"
         f"Chi tiết cần tìm: {subs}\n"
         f"Bao gồm: số hiệu văn bản pháp luật cụ thể, số liệu thị trường, "
         f"tên doanh nghiệp, ví dụ thực tế, nguồn đáng tin cậy"
+        f"{legal_note}"
     )
 
 async def perplexity_search(query: str, model: str = "sonar") -> dict:
@@ -167,8 +193,9 @@ async def tvpl_search(query: str, max_results: int = 10) -> list:
     """Scrape thuvienphapluat.vn for currently-in-effect legal documents."""
     params = {
         "q": query,
-        "sbt": "0",   # sort by relevance
-        "efts": "1",  # còn hiệu lực only
+        "sbt": "1",   # sort by date descending (newest first)
+        "efts": "1",  # còn hiệu lực only — filters out superseded docs
+        "page": "1",
     }
     headers = {
         "User-Agent": (
@@ -298,13 +325,18 @@ def build_section_prompt(section: dict, subject: str, context: str, mode: str, n
     table_block = ""
     if is_legal or is_tax:
         table_block = """
-QUAN TRỌNG: Bắt đầu với bảng tổng hợp văn bản pháp luật/thuế liên quan (ít nhất 6-8 văn bản):
+QUAN TRỌNG — VĂN BẢN PHÁP LUẬT:
+1. CHỈ sử dụng văn bản đang CÒN HIỆU LỰC tại thời điểm hiện tại (2025-2026).
+2. Nếu có văn bản mới thay thế/sửa đổi văn bản cũ → chỉ trích dẫn văn bản MỚI NHẤT.
+3. KHÔNG trích dẫn văn bản đã bị bãi bỏ, thay thế hoặc hết hiệu lực.
+4. Ưu tiên văn bản từ phần "VĂN BẢN PHÁP LUẬT HIỆN HÀNH" trong dữ liệu nghiên cứu.
+5. Bắt đầu section bằng bảng tổng hợp văn bản (ít nhất 6-8 văn bản còn hiệu lực):
 <table>
   <thead><tr>
     <th>Số hiệu</th><th>Tên văn bản</th><th>Loại</th>
-    <th>Ngày hiệu lực</th><th>Tình trạng</th><th>Liên quan</th>
+    <th>Ngày ban hành</th><th>Hiệu lực</th><th>Ghi chú sửa đổi</th>
   </tr></thead>
-  <tbody>... (điền thực tế) ...</tbody>
+  <tbody>... điền thực tế, ghi rõ nếu văn bản này thay thế văn bản nào ...</tbody>
 </table>
 """
 
@@ -323,7 +355,7 @@ YÊU CẦU TUYỆT ĐỐI:
 2. Bắt đầu bằng: <h2>{num}. {title}</h2>
 3. Dùng thẻ HTML: <h3>, <p>, <ul><li>, <ol><li>, <table> — KHÔNG <div> thừa
 4. Văn phong: chuyên nghiệp, cụ thể, dẫn chứng số liệu và tên văn bản pháp luật thực tế
-5. Trích dẫn nguồn inline: <a href="URL" target="_blank">[N]</a>
+5. QUAN TRỌNG — Trích dẫn nguồn inline bắt buộc: Sau mỗi câu hoặc đoạn có dữ liệu/số liệu/tên văn bản, chèn ngay link nguồn dạng: <a href="URL_NGUON" target="_blank">[N]</a> — thay URL_NGUON bằng URL thực tế từ dữ liệu nghiên cứu. Số [N] tăng dần từ [1]. KHÔNG để [N] không có thẻ <a>.
 6. Tối thiểu 700 từ — đầy đủ, không rút gọn
 7. KHÔNG viết lời mở đầu/kết luận tổng quát — chỉ nội dung của phần này"""
 
@@ -353,14 +385,15 @@ def safe_filename(s: str) -> str:
     return re.sub(r'[\\/*?:"<>|]', "", s)[:60].strip()
 
 def save_report(subject: str, html_content: str) -> str:
-    date_str = datetime.now().strftime("%Y%m%d")
+    now = datetime.now()
+    date_str = now.strftime("%d%m%Y")
+    time_str = now.strftime("%H%M")
     base = safe_filename(subject)
-    n = 1
-    while True:
-        name = f"{date_str} - {base} - {n}.html"
-        if not (REPORTS_DIR / name).exists():
-            break
-        n += 1
+    name = f"{date_str} - {base} - {time_str}.html"
+
+    # Handle rare collision (same subject, same minute)
+    if (REPORTS_DIR / name).exists():
+        name = f"{date_str} - {base} - {now.strftime('%H%M%S')}.html"
 
     full_html = f"""<!DOCTYPE html>
 <html lang="vi">
@@ -385,7 +418,7 @@ p{{margin:.6rem 0}}
 </head>
 <body>
 <h1>Phan Tich Thue — {subject}</h1>
-<p><em>Ngay tao: {datetime.now().strftime("%d/%m/%Y %H:%M")}</em></p>
+<p><em>Ngay tao: {now.strftime("%d/%m/%Y %H:%M")}</em></p>
 <div id="report-body">
 {html_content}
 </div>
@@ -393,6 +426,16 @@ p{{margin:.6rem 0}}
 </html>"""
     (REPORTS_DIR / name).write_text(full_html, encoding="utf-8")
     return name
+
+def linkify_citations(html: str, citations: list) -> str:
+    """Replace bare [N] with <a href=...>[N]</a> using citation URLs."""
+    def replacer(m):
+        idx = int(m.group(1)) - 1
+        if 0 <= idx < len(citations) and citations[idx]:
+            url = citations[idx]
+            return f'<a href="{url}" target="_blank">[{idx+1}]</a>'
+        return m.group(0)
+    return re.sub(r'\[(\d+)\](?!</a>)(?![^<]*</a>)', replacer, html)
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 app = FastAPI(title="Tax Sector Research")
@@ -500,6 +543,10 @@ async def stream_report(request: Request, _user: str = Depends(auth)):
         unique_urls = list(dict.fromkeys(all_citations))
         yield sse({"type": "citations", "urls": unique_urls})
 
+        # Linkify any bare [N] citations
+        unique_citations = list(dict.fromkeys(all_citations))
+        full_html = linkify_citations(full_html, unique_citations)
+
         # Save
         try:
             filename = save_report(subject, full_html)
@@ -604,8 +651,12 @@ async def export_docx(request: Request, _user: str = Depends(auth)):
     doc.add_paragraph(f"Ngày tạo: {datetime.now().strftime('%d/%m/%Y')}")
 
     soup = BeautifulSoup(html, "html.parser")
+    # Insert spaces around inline tags to prevent word merging
+    for tag in soup.find_all(["a", "strong", "em", "span", "b", "i"]):
+        tag.insert_before(" ")
+        tag.insert_after(" ")
     for el in soup.find_all(["h2", "h3", "p", "li", "table"]):
-        text = el.get_text(strip=True)
+        text = " ".join(el.get_text(" ", strip=False).split())  # normalize whitespace
         if not text:
             continue
         tag = el.name
@@ -645,49 +696,135 @@ async def export_docx(request: Request, _user: str = Depends(auth)):
         headers={"Content-Disposition": f'attachment; filename="PhanTichThue_{safe}.docx"'},
     )
 
-# ── Slides ────────────────────────────────────────────────────────────────────
+# ── PPTX export ───────────────────────────────────────────────────────────────
 @app.post("/slides")
-async def generate_slides(request: Request, _user: str = Depends(auth)):
+async def export_pptx(request: Request, _user: str = Depends(auth)):
+    from pptx import Presentation
+    from pptx.util import Inches, Pt
+    from pptx.dml.color import RGBColor as PptxRGB
+    from pptx.enum.text import PP_ALIGN
+
     body    = await request.json()
     html    = body.get("html", "")
     subject = body.get("subject", "Báo cáo")
 
-    if not ANTHROPIC_KEY:
-        raise HTTPException(503, "Anthropic API not configured")
+    BRAND = PptxRGB(0x02, 0x8A, 0x39)
+    WHITE = PptxRGB(0xFF, 0xFF, 0xFF)
+    DARK  = PptxRGB(0x1E, 0x29, 0x3B)
+    LIGHT = PptxRGB(0xF8, 0xFA, 0xFC)
+
+    prs = Presentation()
+    prs.slide_width  = Inches(13.333)  # 16:9
+    prs.slide_height = Inches(7.5)
+
+    blank_layout = prs.slide_layouts[6]  # completely blank
+
+    def add_rect(slide, l, t, w, h, fill_color=None):
+        shape = slide.shapes.add_shape(1, Inches(l), Inches(t), Inches(w), Inches(h))
+        if fill_color:
+            shape.fill.solid()
+            shape.fill.fore_color.rgb = fill_color
+        else:
+            shape.fill.background()
+        shape.line.fill.background()
+        return shape
+
+    def add_text_box(slide, text, l, t, w, h, font_size=18, bold=False,
+                     color=None, align=PP_ALIGN.LEFT):
+        txBox = slide.shapes.add_textbox(Inches(l), Inches(t), Inches(w), Inches(h))
+        txBox.word_wrap = True
+        tf = txBox.text_frame
+        tf.word_wrap = True
+        p = tf.paragraphs[0]
+        p.alignment = align
+        run = p.add_run()
+        run.text = text
+        run.font.size = Pt(font_size)
+        run.font.bold = bold
+        if color:
+            run.font.color.rgb = color
+        return txBox
 
     soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(separator="\n", strip=True)[:8000]
 
-    prompt = f"""Tạo bộ slides thuyết trình HTML hoàn chỉnh từ báo cáo phân tích thuế về: {subject}
+    # Slide 1: Cover
+    slide = prs.slides.add_slide(blank_layout)
+    add_rect(slide, 0, 0, 13.333, 7.5, fill_color=BRAND)
+    add_text_box(slide, "PHÂN TÍCH THUẾ",
+                 0.8, 1.5, 11.5, 1.0,
+                 font_size=20, color=PptxRGB(0xBB, 0xF7, 0xD0), align=PP_ALIGN.CENTER)
+    add_text_box(slide, subject,
+                 0.8, 2.5, 11.5, 2.0,
+                 font_size=36, bold=True, color=WHITE, align=PP_ALIGN.CENTER)
+    add_text_box(slide, datetime.now().strftime("%d/%m/%Y"),
+                 0.8, 5.5, 11.5, 0.8,
+                 font_size=16, color=PptxRGB(0xBB, 0xF7, 0xD0), align=PP_ALIGN.CENTER)
 
-Nội dung báo cáo:
-{text}
+    # Content slides: one per h2
+    for h2 in soup.find_all("h2"):
+        title_text = h2.get_text(strip=True)
+        bullets = []
+        for sib in h2.find_next_siblings():
+            if sib.name == "h2":
+                break
+            if sib.name in ("p", "li"):
+                t = sib.get_text(strip=True)
+                if t and len(t) > 10:
+                    bullets.append(t[:200])
+            elif sib.name in ("ul", "ol"):
+                for li in sib.find_all("li"):
+                    t = li.get_text(strip=True)
+                    if t:
+                        bullets.append(t[:200])
+            if len(bullets) >= 7:
+                break
 
-YÊU CẦU:
-- 8-12 slides: slide 1 là trang tiêu đề, mỗi slide sau cho 1 phần chính, slide cuối là khuyến nghị
-- Mỗi slide: tiêu đề lớn + 4-6 bullet points súc tích
-- Style: chuyên nghiệp, màu xanh #028a39, nền trắng/xám nhạt
-- Navigation: nút Prev/Next + phím mũi tên ← →
-- JavaScript thuần (không framework)
-- Print: mỗi slide ra 1 trang A4 landscape (@media print)
-- Font đủ lớn: h2 2rem, li 1.1rem
-- Output: file HTML hoàn chỉnh từ <!DOCTYPE html> đến </html>
-- KHÔNG dùng markdown hay backtick trong output"""
+        slide = prs.slides.add_slide(blank_layout)
+        add_rect(slide, 0, 0, 13.333, 1.4, fill_color=BRAND)
+        add_text_box(slide, title_text,
+                     0.4, 0.1, 12.5, 1.2,
+                     font_size=22, bold=True, color=WHITE, align=PP_ALIGN.LEFT)
+        add_rect(slide, 0, 1.4, 13.333, 6.1, fill_color=LIGHT)
 
-    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
-    msg = await client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=4096,
-        messages=[{"role": "user", "content": prompt}],
+        if bullets:
+            txBox = slide.shapes.add_textbox(
+                Inches(0.5), Inches(1.7), Inches(12.3), Inches(5.5)
+            )
+            txBox.word_wrap = True
+            tf = txBox.text_frame
+            tf.word_wrap = True
+            for i, bullet in enumerate(bullets[:7]):
+                p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+                p.space_before = Pt(6)
+                run = p.add_run()
+                run.text = f"▪  {bullet}"
+                run.font.size = Pt(16)
+                run.font.color.rgb = DARK
+        else:
+            add_text_box(slide, "(Xem báo cáo đầy đủ để biết chi tiết)",
+                         0.5, 2.5, 12.3, 1.0,
+                         font_size=16, color=PptxRGB(0x94, 0xA3, 0xB8))
+
+    # Last slide: Thank you
+    slide = prs.slides.add_slide(blank_layout)
+    add_rect(slide, 0, 0, 13.333, 7.5, fill_color=BRAND)
+    add_text_box(slide, "Cảm ơn",
+                 0.8, 2.5, 11.5, 1.5,
+                 font_size=40, bold=True, color=WHITE, align=PP_ALIGN.CENTER)
+    add_text_box(slide, "Báo cáo được tạo bởi Tax Sector Research AI",
+                 0.8, 4.2, 11.5, 1.0,
+                 font_size=16, color=PptxRGB(0xBB, 0xF7, 0xD0), align=PP_ALIGN.CENTER)
+
+    buf = io.BytesIO()
+    prs.save(buf)
+    buf.seek(0)
+
+    safe = re.sub(r'[^\w\s-]', '', subject)[:50].strip().replace(' ', '_')
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        headers={"Content-Disposition": f'attachment; filename="TaxSlides_{safe}.pptx"'},
     )
-    slides_html = msg.content[0].text
-
-    # Strip markdown wrapper if present
-    m = re.search(r'```html\s*(.*?)\s*```', slides_html, re.DOTALL)
-    if m:
-        slides_html = m.group(1)
-
-    return {"slides_html": slides_html}
 
 # ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
@@ -707,6 +844,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Tax Sector Research</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="shortcut icon" href="/favicon.svg">
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
 :root{--brand:#028a39;--brand-dk:#016d2d;--bg:#f8fafc;--surface:#fff;--border:#e2e8f0;--text:#1e293b;--muted:#64748b}
@@ -885,7 +1024,7 @@ body.dark .sec-card input[type=text]{background:transparent}
     <!-- Toolbar -->
     <div class="no-print flex flex-wrap items-center gap-2 mb-4 surface rounded-xl p-3 shadow-sm sticky top-2 z-40">
       <button onclick="window.print()" class="btn btn-gray">🖨️ In/PDF</button>
-      <button id="btn-slides" onclick="doSlides()" class="btn btn-gray">📑 Slides</button>
+      <button id="btn-slides" onclick="doSlides()" class="btn btn-gray">📑 Slides PPTX</button>
       <button id="btn-docx" onclick="doDocx()" class="btn btn-gray">📄 Word</button>
       <button onclick="openReports()" class="btn btn-gray">📂 Báo cáo đã lưu</button>
       <div class="flex-1"></div>
@@ -933,16 +1072,6 @@ body.dark .sec-card input[type=text]{background:transparent}
   </div>
 </div>
 
-<!-- ── Slides Modal ──────────────────────────────────────────── -->
-<div id="modal-slides" class="fixed inset-0 bg-black/80 z-50 hidden flex items-center justify-center">
-  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-4xl mx-4 flex flex-col" style="height:85vh">
-    <div class="p-4 border-b flex items-center justify-between shrink-0">
-      <h2 class="font-bold text-gray-800">📑 Trình chiếu</h2>
-      <button onclick="closeModal('modal-slides')" class="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
-    </div>
-    <iframe id="slides-frame" class="flex-1 w-full rounded-b-2xl" src="about:blank"></iframe>
-  </div>
-</div>
 
 <script>
 // ── State ─────────────────────────────────────────────────────
@@ -1279,7 +1408,7 @@ async function doSlides() {
   if (!reportHtml) return;
   const subject = document.getElementById('rpt-title').textContent.replace('Phân Tích Thuế — ', '');
   const btn = document.getElementById('btn-slides');
-  btn.textContent = '⏳ Đang tạo...';
+  btn.textContent = '⏳ Đang tạo PPTX...';
   btn.disabled = true;
   try {
     const r = await fetch('/slides', {
@@ -1288,14 +1417,18 @@ async function doSlides() {
       body: JSON.stringify({html: reportHtml, subject}),
     });
     if (r.ok) {
-      const {slides_html} = await r.json();
-      document.getElementById('slides-frame').srcdoc = slides_html;
-      openModal('modal-slides');
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = (currentFile || subject).replace('.html', '') + '.pptx';
+      a.click();
+      URL.revokeObjectURL(url);
     } else {
-      alert('Không thể tạo slides');
+      alert('Không thể tạo PPTX');
     }
   } catch(e) { alert('Lỗi: ' + e.message); }
-  finally { btn.textContent = '📑 Slides'; btn.disabled = false; }
+  finally { btn.textContent = '📑 Slides PPTX'; btn.disabled = false; }
 }
 
 async function doDocx() {
@@ -1431,11 +1564,20 @@ document.querySelectorAll('[id^="modal-"]').forEach(m =>
   m.addEventListener('click', e => { if (e.target === m) closeModal(m.id); }));
 
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') ['modal-reports','modal-slides'].forEach(closeModal);
+  if (e.key === 'Escape') closeModal('modal-reports');
 });
 </script>
 </body>
 </html>"""
+
+# ── Favicon ───────────────────────────────────────────────────────────────────
+@app.get("/favicon.svg", include_in_schema=False)
+async def favicon():
+    import pathlib
+    svg_path = pathlib.Path(__file__).parent / "favicon.svg"
+    if svg_path.exists():
+        return FileResponse(svg_path, media_type="image/svg+xml")
+    return Response(status_code=404)
 
 # ── Serve frontend ────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
