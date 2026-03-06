@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import AsyncGenerator
 
+import anthropic
 import httpx
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
@@ -16,9 +17,8 @@ from bs4 import BeautifulSoup
 
 # ── Config ────────────────────────────────────────────────────────────────────
 PERPLEXITY_KEY = os.getenv("PERPLEXITY_API_KEY", "")
-CLAUDE_KEY     = os.getenv("CLAUDIBLE_API_KEY", "")
-CLAUDE_URL     = os.getenv("CLAUDIBLE_BASE_URL", "https://claudible.io/v1")
-CLAUDE_MODEL   = os.getenv("CLAUDIBLE_MODEL", "claude-sonnet-4.6")
+ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
+CLAUDE_MODEL   = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5")
 APP_USER       = os.getenv("APP_USERNAME", "hoang")
 APP_PASS       = os.getenv("APP_PASSWORD", "taxsector2026")
 REPORTS_DIR    = Path(os.getenv("REPORTS_DIR", "./reports"))
@@ -127,6 +127,130 @@ async def perplexity_search(query: str, model: str = "sonar") -> dict:
         except Exception as e:
             return {"content": f"[Research error: {e}]", "citations": []}
 
+# ── Research: thuvienphapluat.vn ─────────────────────────────────────────────
+TVPL_BASE = "https://thuvienphapluat.vn"
+
+def is_legal_or_tax_section(section: dict) -> bool:
+    """Return True if this section needs legal docs from thuvienphapluat.vn."""
+    title = section.get("title", "").lower()
+    subs  = " ".join(section.get("sub", [])).lower()
+    keywords = [
+        "pháp lý", "luật", "quy định", "giấy phép",
+        "thuế", "thue", "tndn", "gtgt", "ttđb", "xnk",
+        "nhà thầu", "chuyển giá", "ưu đãi", "tuân thủ",
+        "phap ly", "van ban", "legal",
+    ]
+    return any(kw in title + " " + subs for kw in keywords)
+
+def build_tvpl_query(section: dict, subject: str) -> str:
+    title = section.get("title", "").lower()
+    subs  = " ".join(section.get("sub", [])).lower()
+    kw_map = {
+        "thuế gtgt": "thuế giá trị gia tăng",
+        "thuế tndn": "thuế thu nhập doanh nghiệp",
+        "thuế ttđb": "thuế tiêu thụ đặc biệt",
+        "thuế xnk": "thuế xuất nhập khẩu",
+        "nhà thầu": "thuế nhà thầu",
+        "chuyển giá": "chuyển giá",
+        "ưu đãi": f"ưu đãi thuế {subject}",
+        "thuế": f"thuế {subject}",
+        "pháp lý": subject,
+        "luật": subject,
+        "quy định": subject,
+    }
+    for kw, q in kw_map.items():
+        if kw in title or kw in subs:
+            return q
+    return subject
+
+async def tvpl_search(query: str, max_results: int = 10) -> list:
+    """Scrape thuvienphapluat.vn for currently-in-effect legal documents."""
+    params = {
+        "q": query,
+        "sbt": "0",   # sort by relevance
+        "efts": "1",  # còn hiệu lực only
+    }
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8",
+        "Referer": TVPL_BASE,
+    }
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0), follow_redirects=True) as client:
+        try:
+            r = await client.get(
+                f"{TVPL_BASE}/van-ban-phap-luat.aspx",
+                params=params,
+                headers=headers,
+            )
+            r.raise_for_status()
+        except Exception as e:
+            return [{"error": str(e)}]
+
+    soup = BeautifulSoup(r.text, "lxml")
+    results = []
+
+    items = (
+        soup.select("div.doc-item") or
+        soup.select("ul.result-list > li") or
+        soup.select(".document-list .item") or
+        soup.select("table.list-vb tr") or
+        soup.select("a[href*='/van-ban/']")
+    )
+
+    doc_types = [
+        "Luật", "Nghị định", "Thông tư", "Quyết định",
+        "Nghị quyết", "Chỉ thị", "Công văn", "Pháp lệnh",
+        "Hiệp định", "Thông tư liên tịch",
+    ]
+    issuers = [
+        "Quốc hội", "Chính phủ", "Bộ Tài chính", "Bộ Kế hoạch và Đầu tư",
+        "Tổng cục Thuế", "Bộ Công Thương", "Ngân hàng Nhà nước",
+        "Bộ Lao động", "UBND", "Bộ Xây dựng",
+    ]
+
+    for item in items[:max_results]:
+        doc = {}
+        link = item.select_one("a[href*='/van-ban/']") or (item if item.name == "a" else None)
+        if not link:
+            continue
+        doc["title"] = link.get_text(strip=True)
+        href = link.get("href", "")
+        doc["url"] = href if href.startswith("http") else f"{TVPL_BASE}{href}"
+        if not doc["title"] or not doc["url"]:
+            continue
+        meta = item.get_text(" ", strip=True)
+        doc["doc_type"] = next((t for t in doc_types if t in doc["title"]), "Văn bản")
+        date_m = re.search(r'\b(\d{2}/\d{2}/\d{4})\b', meta)
+        doc["issued_date"] = date_m.group(1) if date_m else ""
+        doc["issuer"] = next((i for i in issuers if i in meta), "")
+        doc["status"] = "Còn hiệu lực"
+        results.append(doc)
+
+    return results
+
+def format_tvpl_results(docs: list) -> str:
+    """Format TVPL docs as context text for Claude."""
+    valid = [d for d in docs if "error" not in d and d.get("title")]
+    if not valid:
+        return ""
+    lines = ["=== VĂN BẢN PHÁP LUẬT HIỆN HÀNH (nguồn: thuvienphapluat.vn) ===\n"]
+    for i, d in enumerate(valid, 1):
+        lines.append(
+            f"{i}. [{d['doc_type']}] {d['title']}\n"
+            f"   URL: {d['url']}\n"
+            f"   Ban hành: {d.get('issued_date','')} | "
+            f"Cơ quan: {d.get('issuer','')} | Trạng thái: Còn hiệu lực\n"
+        )
+    return "\n".join(lines)
+
+async def _empty():
+    return []
+
 # ── Context filtering ─────────────────────────────────────────────────────────
 KEYWORD_MAP = {
     "pháp lý": ["s4", "c4"],
@@ -206,45 +330,23 @@ YÊU CẦU TUYỆT ĐỐI:
 async def claude_stream_section(
     section: dict, subject: str, context: str, mode: str, num: int
 ) -> AsyncGenerator[str, None]:
-    if not CLAUDE_KEY:
-        yield f"<h2>{num}. {section['title']}</h2><p><em>[Claude API key not configured]</em></p>"
+    if not ANTHROPIC_KEY:
+        yield f"<h2>{num}. {section['title']}</h2><p><em>[Anthropic API key not configured]</em></p>"
         return
 
     prompt = build_section_prompt(section, subject, context, mode, num)
-    payload = {
-        "model": CLAUDE_MODEL,
-        "max_tokens": 2000,
-        "stream": True,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    headers = {
-        "Authorization": f"Bearer {CLAUDE_KEY}",
-        "Content-Type": "application/json",
-    }
+    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
 
-    timeout = httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=30.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        try:
-            async with client.stream(
-                "POST", f"{CLAUDE_URL}/chat/completions",
-                headers=headers, json=payload
-            ) as resp:
-                resp.raise_for_status()
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    data = line[6:]
-                    if data == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data)
-                        delta = chunk["choices"][0]["delta"].get("content", "")
-                        if delta:
-                            yield delta
-                    except Exception:
-                        pass
-        except Exception as e:
-            yield f'<p style="color:red">[Error in section {num}: {e}]</p>'
+    try:
+        async with client.messages.stream(
+            model=CLAUDE_MODEL,
+            max_tokens=8192,
+            messages=[{"role": "user", "content": prompt}],
+        ) as stream:
+            async for text in stream.text_stream:
+                yield text
+    except Exception as e:
+        yield f'<p style="color:red">[Error in section {num}: {e}]</p>'
 
 # ── Report persistence ────────────────────────────────────────────────────────
 def safe_filename(s: str) -> str:
@@ -318,8 +420,9 @@ async def stream_report(request: Request, _user: str = Depends(auth)):
         yield sse({"type": "ping"})
         yield sse({"type": "status", "message": f"Đang nghiên cứu '{subject}'..."})
 
-        # Phase 1: parallel research in batches of 4
+        # Phase 1: parallel research — Perplexity + thuvienphapluat.vn
         all_results: dict = {}
+        all_tvpl: dict = {}
         all_citations: list = []
         total = len(enabled)
 
@@ -334,19 +437,35 @@ async def stream_report(request: Request, _user: str = Depends(auth)):
                     "label": f"Đang nghiên cứu: {sec['title']}",
                 })
 
-            results = await asyncio.gather(*[
+            perplexity_tasks = [
                 perplexity_search(build_query(s, subject, mode), sonar)
                 for s in batch
-            ])
+            ]
+            tvpl_tasks = [
+                tvpl_search(build_tvpl_query(s, subject))
+                if is_legal_or_tax_section(s)
+                else _empty()
+                for s in batch
+            ]
 
-            for sec, res in zip(batch, results):
-                all_results[sec["id"]] = res
-                all_citations.extend(res.get("citations", []))
+            perplexity_results, tvpl_results = await asyncio.gather(
+                asyncio.gather(*perplexity_tasks),
+                asyncio.gather(*tvpl_tasks),
+            )
+
+            for sec, pres, tres in zip(batch, perplexity_results, tvpl_results):
+                all_results[sec["id"]] = pres
+                all_tvpl[sec["id"]]    = tres or []
+                all_citations.extend(pres.get("citations", []))
+                all_citations.extend(
+                    d.get("url", "") for d in (tres or []) if d.get("url")
+                )
+                tvpl_note = f" (+{len(tres)} văn bản PL)" if tres else ""
                 yield sse({
                     "type": "progress",
                     "step": batch_start + batch.index(sec) + 1,
                     "total": total,
-                    "label": f"Xong research: {sec['title']}",
+                    "label": f"Xong research: {sec['title']}{tvpl_note}",
                 })
 
         # Phase 2: Claude per section
@@ -359,6 +478,14 @@ async def stream_report(request: Request, _user: str = Depends(auth)):
                 "message": f"AI đang viết phần {i + 1}/{len(enabled)}: {section['title']}",
             })
             ctx = filter_context(all_results, section)
+
+            # Prepend TVPL legal docs for law/tax sections
+            tvpl_docs = all_tvpl.get(section["id"], [])
+            if tvpl_docs and is_legal_or_tax_section(section):
+                tvpl_text = format_tvpl_results(tvpl_docs)
+                if tvpl_text:
+                    ctx = tvpl_text + "\n\n" + ctx
+
             sec_html = ""
 
             async for chunk in claude_stream_section(section, subject, ctx, mode, i + 1):
@@ -403,7 +530,7 @@ async def suggest_subsections(request: Request, _user: str = Depends(auth)):
     title   = body.get("title", "")
     subject = body.get("subject", "")
 
-    if not CLAUDE_KEY:
+    if not ANTHROPIC_KEY:
         return {"suggestions": []}
 
     prompt = (
@@ -412,23 +539,18 @@ async def suggest_subsections(request: Request, _user: str = Depends(auth)):
         f'Trả về JSON array, ví dụ: ["Chủ đề 1", "Chủ đề 2"]\n'
         f'Chỉ trả về JSON array, không giải thích thêm.'
     )
-    payload = {
-        "model": CLAUDE_MODEL,
-        "max_tokens": 300,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
-        try:
-            r = await client.post(
-                f"{CLAUDE_URL}/chat/completions",
-                headers={"Authorization": f"Bearer {CLAUDE_KEY}", "Content-Type": "application/json"},
-                json=payload,
-            )
-            content = r.json()["choices"][0]["message"]["content"]
-            match = re.search(r'\[.*\]', content, re.DOTALL)
-            suggestions = json.loads(match.group()) if match else []
-        except Exception:
-            suggestions = []
+    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
+    try:
+        msg = await client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        content = msg.content[0].text
+        match = re.search(r'\[.*\]', content, re.DOTALL)
+        suggestions = json.loads(match.group()) if match else []
+    except Exception:
+        suggestions = []
     return {"suggestions": suggestions}
 
 # ── Reports ───────────────────────────────────────────────────────────────────
@@ -530,8 +652,8 @@ async def generate_slides(request: Request, _user: str = Depends(auth)):
     html    = body.get("html", "")
     subject = body.get("subject", "Báo cáo")
 
-    if not CLAUDE_KEY:
-        raise HTTPException(503, "Claude API not configured")
+    if not ANTHROPIC_KEY:
+        raise HTTPException(503, "Anthropic API not configured")
 
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(separator="\n", strip=True)[:8000]
@@ -552,20 +674,13 @@ YÊU CẦU:
 - Output: file HTML hoàn chỉnh từ <!DOCTYPE html> đến </html>
 - KHÔNG dùng markdown hay backtick trong output"""
 
-    payload = {
-        "model": CLAUDE_MODEL,
-        "max_tokens": 4000,
-        "stream": False,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
-        r = await client.post(
-            f"{CLAUDE_URL}/chat/completions",
-            headers={"Authorization": f"Bearer {CLAUDE_KEY}", "Content-Type": "application/json"},
-            json=payload,
-        )
-        r.raise_for_status()
-        slides_html = r.json()["choices"][0]["message"]["content"]
+    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
+    msg = await client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=4096,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    slides_html = msg.content[0].text
 
     # Strip markdown wrapper if present
     m = re.search(r'```html\s*(.*?)\s*```', slides_html, re.DOTALL)
@@ -577,7 +692,13 @@ YÊU CẦU:
 # ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health(_user: str = Depends(auth)):
-    return {"status": "ok", "model": CLAUDE_MODEL}
+    return {
+        "status": "ok",
+        "model": CLAUDE_MODEL,
+        "anthropic_configured": bool(ANTHROPIC_KEY),
+        "perplexity_configured": bool(PERPLEXITY_KEY),
+        "tvpl_scraper": "enabled",
+    }
 
 # ── Frontend ──────────────────────────────────────────────────────────────────
 HTML_PAGE = r"""<!DOCTYPE html>
