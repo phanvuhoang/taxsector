@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- Background circle -->
+  <circle cx="16" cy="16" r="16" fill="#028a39"/>
+  <!-- Bar chart bars -->
+  <rect x="5" y="18" width="4" height="8" rx="1" fill="white" opacity="0.9"/>
+  <rect x="11" y="13" width="4" height="13" rx="1" fill="white" opacity="0.9"/>
+  <rect x="17" y="9" width="4" height="17" rx="1" fill="white" opacity="0.9"/>
+  <!-- Magnifying glass -->
+  <circle cx="25" cy="9" r="4" fill="none" stroke="#bbf7d0" stroke-width="2"/>
+  <line x1="22.5" y1="12" x2="20" y2="15" stroke="#bbf7d0" stroke-width="2" stroke-linecap="round"/>
+</svg>
