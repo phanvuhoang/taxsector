@@ -104,17 +104,29 @@ COMPANY_SECTIONS_VI = [
 
 # ── Research: Perplexity ──────────────────────────────────────────────────────
 def build_query(section: dict, subject: str, mode: str) -> str:
+    from datetime import datetime
     current_year = datetime.now().year
     mode_ctx = "ngành" if mode == "sector" else "công ty"
+
+    # For company mode, add industry hint to help Perplexity find relevant laws
+    subject_ctx = subject
+    if mode == "company":
+        subject_ctx = f"{subject} (phân tích thuế doanh nghiệp)"
+
     subs = ", ".join(section.get("sub", []))
-    is_legal = any(k in section.get("title", "").lower() for k in ["pháp lý", "luật", "quy định", "thuế", "thue"])
+    title_lower = section.get("title", "").lower()
+    is_legal = any(k in title_lower for k in [
+        "pháp lý","luật","quy định","thuế","thue","tài chính","rủi ro","tranh chấp"
+    ])
     legal_note = (
-        f"\nLƯU Ý QUAN TRỌNG: Chỉ trích dẫn văn bản pháp luật CÒN HIỆU LỰC tính đến {current_year}. "
-        f"Nếu có Luật/Nghị định/Thông tư mới thay thế → bắt buộc dùng văn bản MỚI NHẤT. "
-        f"Ghi rõ văn bản nào thay thế văn bản nào."
+        f"\nLƯU Ý BẮT BUỘC: Chỉ trích dẫn văn bản pháp luật CÒN HIỆU LỰC tính đến {current_year}. "
+        f"Ưu tiên Luật/Nghị định/Thông tư được ban hành hoặc sửa đổi trong 2020-{current_year}. "
+        f"Nếu có văn bản mới thay thế → bắt buộc dùng văn bản MỚI NHẤT, ghi rõ nó thay thế văn bản nào. "
+        f"KHÔNG trích dẫn văn bản đã bị bãi bỏ."
     ) if is_legal else ""
+
     return (
-        f"Nghiên cứu chuyên sâu về: {section['title']} — {mode_ctx} {subject} tại Việt Nam năm {current_year}\n"
+        f"Nghiên cứu chuyên sâu về: {section['title']} — {mode_ctx} {subject_ctx} tại Việt Nam năm {current_year}\n"
         f"Chi tiết cần tìm: {subs}\n"
         f"Bao gồm: số hiệu văn bản pháp luật cụ thể, số liệu thị trường, "
         f"tên doanh nghiệp, ví dụ thực tế, nguồn đáng tin cậy"
@@ -165,29 +177,42 @@ def is_legal_or_tax_section(section: dict) -> bool:
         "thuế", "thue", "tndn", "gtgt", "ttđb", "xnk",
         "nhà thầu", "chuyển giá", "ưu đãi", "tuân thủ",
         "phap ly", "van ban", "legal",
+        # Company-specific additions:
+        "tài chính", "gánh nặng", "tỷ lệ thuế", "rủi ro thuế",
+        "thanh tra", "kiểm tra", "giao dịch liên kết", "cấu trúc pháp",
+        "rui ro", "tranh chap", "ruling", "cong van",
     ]
     return any(kw in title + " " + subs for kw in keywords)
 
-def build_tvpl_query(section: dict, subject: str) -> str:
+def build_tvpl_query(section: dict, subject: str, mode: str = "sector") -> str:
     title = section.get("title", "").lower()
     subs  = " ".join(section.get("sub", [])).lower()
+
+    # For company mode: add "doanh nghiệp" context
+    base_subject = subject
+    if mode == "company":
+        base_subject = f"{subject} doanh nghiệp"
+
     kw_map = {
         "thuế gtgt": "thuế giá trị gia tăng",
         "thuế tndn": "thuế thu nhập doanh nghiệp",
         "thuế ttđb": "thuế tiêu thụ đặc biệt",
         "thuế xnk": "thuế xuất nhập khẩu",
         "nhà thầu": "thuế nhà thầu",
-        "chuyển giá": "chuyển giá",
-        "ưu đãi": f"ưu đãi thuế {subject}",
-        "thuế": f"thuế {subject}",
-        "pháp lý": subject,
-        "luật": subject,
-        "quy định": subject,
+        "chuyển giá": "chuyển giá giao dịch liên kết",
+        "ưu đãi": f"ưu đãi thuế {base_subject}",
+        "tranh chấp": f"tranh chấp thuế {base_subject}",
+        "giao dịch liên kết": "chuyển giá giao dịch liên kết",
+        "tài chính": f"thuế {base_subject}",
+        "thuế": f"thuế {base_subject}",
+        "pháp lý": base_subject,
+        "luật": base_subject,
+        "quy định": base_subject,
     }
     for kw, q in kw_map.items():
         if kw in title or kw in subs:
             return q
-    return subject
+    return f"thuế {base_subject}"
 
 async def tvpl_search(query: str, max_results: int = 10) -> list:
     """Scrape thuvienphapluat.vn for currently-in-effect legal documents."""
@@ -355,7 +380,15 @@ YÊU CẦU TUYỆT ĐỐI:
 2. Bắt đầu bằng: <h2>{num}. {title}</h2>
 3. Dùng thẻ HTML: <h3>, <p>, <ul><li>, <ol><li>, <table> — KHÔNG <div> thừa
 4. Văn phong: chuyên nghiệp, cụ thể, dẫn chứng số liệu và tên văn bản pháp luật thực tế
-5. QUAN TRỌNG — Trích dẫn nguồn inline bắt buộc: Sau mỗi câu hoặc đoạn có dữ liệu/số liệu/tên văn bản, chèn ngay link nguồn dạng: <a href="URL_NGUON" target="_blank">[N]</a> — thay URL_NGUON bằng URL thực tế từ dữ liệu nghiên cứu. Số [N] tăng dần từ [1]. KHÔNG để [N] không có thẻ <a>.
+5. TRÍCH DẪN NGUỒN — BẮT BUỘC TUYỆT ĐỐI:
+   - Sau MỖI câu có số liệu, tên văn bản, hoặc thông tin cụ thể → chèn ngay: <a href="URL" target="_blank" rel="noopener">[N]</a>
+   - N là số thứ tự tăng dần từ 1 trong toàn bộ phần này
+   - URL phải là URL thực tế từ dữ liệu nghiên cứu (Perplexity citations hoặc thuvienphapluat.vn)
+   - Nếu không có URL cụ thể cho câu đó → dùng URL tổng quát của nguồn
+   - KHÔNG viết [N] mà không có thẻ <a href=...>
+   - KHÔNG gộp nhiều câu dùng chung 1 citation số
+   Ví dụ đúng: Thuế GTGT hiện hành là 10%.<a href="https://thuvienphapluat.vn/van-ban/..." target="_blank" rel="noopener">[1]</a>
+   Ví dụ sai: Thuế GTGT hiện hành là 10%.[1] hoặc [1] không có href
 6. Tối thiểu 700 từ — đầy đủ, không rút gọn
 7. KHÔNG viết lời mở đầu/kết luận tổng quát — chỉ nội dung của phần này"""
 
@@ -381,6 +414,19 @@ async def claude_stream_section(
         yield f'<p style="color:red">[Error in section {num}: {e}]</p>'
 
 # ── Report persistence ────────────────────────────────────────────────────────
+CAVEAT_HTML = """
+<div style="margin-top:3rem;padding:1rem 1.5rem;background:#f8fafc;border-top:2px solid #e2e8f0;
+            border-radius:.5rem;font-size:.8rem;color:#64748b;line-height:1.6">
+  <strong>&#9888;&#65039; Lưu ý quan trọng:</strong> Báo cáo này được tạo tự động bởi
+  <strong>Tax Sector Research AI</strong> dựa trên dữ liệu từ Perplexity (sonar model)
+  và thuvienphapluat.vn. Nội dung mang tính tham khảo, không thay thế tư vấn pháp lý
+  hoặc thuế chuyên nghiệp. Người dùng cần kiểm chứng độc lập trước khi áp dụng.
+  Thông tin pháp luật có thể thay đổi — vui lòng xác nhận hiệu lực văn bản tại
+  <a href="https://thuvienphapluat.vn" target="_blank" rel="noopener">thuvienphapluat.vn</a>.
+  <br><em>Ngày tạo: {date_str}</em>
+</div>
+"""
+
 def safe_filename(s: str) -> str:
     return re.sub(r'[\\/*?:"<>|]', "", s)[:60].strip()
 
@@ -422,20 +468,22 @@ p{{margin:.6rem 0}}
 <div id="report-body">
 {html_content}
 </div>
+{CAVEAT_HTML.format(date_str=now.strftime("%d/%m/%Y %H:%M"))}
 </body>
 </html>"""
     (REPORTS_DIR / name).write_text(full_html, encoding="utf-8")
     return name
 
 def linkify_citations(html: str, citations: list) -> str:
-    """Replace bare [N] with <a href=...>[N]</a> using citation URLs."""
+    """Safety net: replace bare [N] with linked version using citation URLs."""
     def replacer(m):
         idx = int(m.group(1)) - 1
         if 0 <= idx < len(citations) and citations[idx]:
             url = citations[idx]
-            return f'<a href="{url}" target="_blank">[{idx+1}]</a>'
+            return f'<a href="{url}" target="_blank" rel="noopener">[{idx+1}]</a>'
         return m.group(0)
-    return re.sub(r'\[(\d+)\](?!</a>)(?![^<]*</a>)', replacer, html)
+    # Only replace [N] that are NOT already inside an <a> tag
+    return re.sub(r'(?<!href=")\[(\d+)\](?![^<]*</a>)', replacer, html)
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 app = FastAPI(title="Tax Sector Research")
@@ -485,7 +533,7 @@ async def stream_report(request: Request, _user: str = Depends(auth)):
                 for s in batch
             ]
             tvpl_tasks = [
-                tvpl_search(build_tvpl_query(s, subject))
+                tvpl_search(build_tvpl_query(s, subject, mode))
                 if is_legal_or_tax_section(s)
                 else _empty()
                 for s in batch
@@ -528,6 +576,14 @@ async def stream_report(request: Request, _user: str = Depends(auth)):
                 tvpl_text = format_tvpl_results(tvpl_docs)
                 if tvpl_text:
                     ctx = tvpl_text + "\n\n" + ctx
+
+            # Inject citation URLs so Claude can use real links
+            section_citations = all_results.get(section["id"], {}).get("citations", [])
+            tvpl_urls = [d.get("url","") for d in tvpl_docs if d.get("url")]
+            all_section_urls = section_citations + tvpl_urls
+            if all_section_urls:
+                url_list = "\n".join(f"[{i+1}] {u}" for i,u in enumerate(all_section_urls[:20]))
+                ctx = f"=== DANH SÁCH URL NGUỒN (dùng cho citation) ===\n{url_list}\n\n" + ctx
 
             sec_html = ""
 
@@ -599,6 +655,64 @@ async def suggest_subsections(request: Request, _user: str = Depends(auth)):
     except Exception:
         suggestions = []
     return {"suggestions": suggestions}
+
+# ── AI Section Recommender ────────────────────────────────────────────────────
+@app.post("/recommend-sections")
+async def recommend_sections(request: Request, _user: str = Depends(auth)):
+    body    = await request.json()
+    subject = body.get("subject", "").strip()
+    mode    = body.get("mode", "sector")
+
+    if not subject:
+        raise HTTPException(400, "Missing subject")
+    if not ANTHROPIC_KEY:
+        return {"sections": SECTOR_SECTIONS_VI if mode == "sector" else COMPANY_SECTIONS_VI}
+
+    mode_ctx = "ngành/lĩnh vực" if mode == "sector" else "công ty"
+    prompt = f"""Bạn là chuyên gia tư vấn thuế Big 4 (Deloitte/PwC/EY/KPMG) với 20 năm kinh nghiệm.
+
+Nhà tư vấn thuế cần nghiên cứu về {mode_ctx}: **{subject}**
+
+Hãy đề xuất cấu trúc báo cáo phân tích thuế TỐI ƯU cho đối tượng này.
+Dựa trên đặc thù của {subject}, hãy:
+1. Xác định các section quan trọng nhất (5-8 section)
+2. Với mỗi section, liệt kê 4-6 sub-items CỤ THỂ cho {subject} (không chung chung)
+3. Đặc biệt chú ý các vấn đề thuế đặc thù, rủi ro cao, hoặc quy định mới nhất cho ngành/công ty này
+
+Trả về JSON ARRAY theo format sau, KHÔNG giải thích thêm:
+[
+  {{
+    "id": "s1",
+    "title": "Tên section tiếng Việt",
+    "sub": ["sub-item 1 cụ thể", "sub-item 2 cụ thể"],
+    "enabled": true
+  }}
+]
+
+Chỉ trả về JSON array, bắt đầu bằng [ và kết thúc bằng ]."""
+
+    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
+    try:
+        msg = await client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        content = msg.content[0].text.strip()
+        match = re.search(r'\[.*\]', content, re.DOTALL)
+        if match:
+            sections = json.loads(match.group())
+            for i, s in enumerate(sections):
+                if "id" not in s:
+                    s["id"] = f"r{i+1}"
+                if "enabled" not in s:
+                    s["enabled"] = True
+            return {"sections": sections, "ai_recommended": True}
+        else:
+            return {"sections": SECTOR_SECTIONS_VI if mode == "sector" else COMPANY_SECTIONS_VI}
+    except Exception as e:
+        return {"sections": SECTOR_SECTIONS_VI if mode == "sector" else COMPANY_SECTIONS_VI,
+                "error": str(e)}
 
 # ── Reports ───────────────────────────────────────────────────────────────────
 @app.get("/reports")
@@ -970,6 +1084,15 @@ body.dark .sec-card input[type=text]{background:transparent}
           <input type="radio" name="sonar" value="sonar-pro" class="accent-green-600"> Sonar Pro (sâu)
         </label>
       </div>
+      <div class="mt-3 flex items-center gap-3">
+        <button id="btn-recommend" onclick="aiRecommend()"
+          class="btn btn-green text-sm">
+          ✨ AI Gợi ý cấu trúc cho chủ đề này
+        </button>
+        <span id="recommend-hint" class="text-xs" style="color:var(--muted)">
+          Nhập tên ngành/công ty rồi bấm để AI đề xuất sections phù hợp
+        </span>
+      </div>
     </div>
 
     <!-- Section editor -->
@@ -1229,6 +1352,44 @@ async function suggestSubs(secId) {
 }
 
 // ── Research ──────────────────────────────────────────────────
+async function aiRecommend() {
+  const subject = document.getElementById('subj-input').value.trim();
+  if (!subject) {
+    alert('Vui lòng nhập tên ngành hoặc công ty trước');
+    return;
+  }
+  const btn = document.getElementById('btn-recommend');
+  const hint = document.getElementById('recommend-hint');
+  btn.textContent = '⏳ AI đang phân tích...';
+  btn.disabled = true;
+  hint.textContent = 'Đang gợi ý sections phù hợp với ' + subject + '...';
+
+  try {
+    const r = await fetch('/recommend-sections', {
+      method: 'POST',
+      headers: {Authorization: AUTH, 'Content-Type': 'application/json'},
+      body: JSON.stringify({subject, mode}),
+    });
+    if (r.ok) {
+      const data = await r.json();
+      if (data.sections && data.sections.length) {
+        sections = data.sections;
+        renderSections();
+        hint.textContent = data.ai_recommended
+          ? `✅ AI đã đề xuất ${data.sections.length} sections tối ưu cho "${subject}"`
+          : '⚠️ Dùng sections mặc định (AI không khả dụng)';
+      }
+    } else {
+      hint.textContent = 'Không thể lấy gợi ý — dùng sections mặc định';
+    }
+  } catch(e) {
+    hint.textContent = 'Lỗi: ' + e.message;
+  } finally {
+    btn.textContent = '✨ AI Gợi ý cấu trúc cho chủ đề này';
+    btn.disabled = false;
+  }
+}
+
 async function startResearch() {
   const subject = document.getElementById('subj-input').value.trim();
   if (!subject) { alert('Vui lòng nhập tên ngành hoặc công ty'); return; }
@@ -1331,6 +1492,12 @@ function finishReport(subject) {
   const content = document.getElementById('report-content');
   content.innerHTML = reportHtml;
   content.style.fontSize = fontSize + 'px';
+
+  // Add AI caveat at bottom
+  const caveat = document.createElement('div');
+  caveat.style.cssText = 'margin-top:2rem;padding:1rem;background:var(--bg);border-top:2px solid var(--border);border-radius:.5rem;font-size:.8rem;color:var(--muted);line-height:1.6';
+  caveat.innerHTML = '<strong>&#9888;&#65039; Lưu ý:</strong> Báo cáo tạo bởi AI (Tax Sector Research). Mang tính tham khảo, không thay thế tư vấn thuế chuyên nghiệp. Kiểm chứng hiệu lực văn bản tại <a href="https://thuvienphapluat.vn" target="_blank" style="color:var(--brand)">thuvienphapluat.vn</a>.';
+  content.appendChild(caveat);
 
   buildTOC();
   buildSources();
