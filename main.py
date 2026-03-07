@@ -1,6 +1,6 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.security import HTTPBasic, HTTPBasicCredentials, OAuth2PasswordBearer, OAuth2PasswordRequestForm
 # Claude via httpx directly (no SDK timeout issues)
 from io import BytesIO
 try:
@@ -16,6 +16,12 @@ except ImportError:
         DOCX_OK = True
     except Exception:
         DOCX_OK = False
+
+try:
+    from bs4 import BeautifulSoup
+    BS4_OK = True
+except ImportError:
+    BS4_OK = False
 import httpx
 import asyncio
 import json
@@ -23,11 +29,32 @@ import os
 import re
 import secrets
 import subprocess
-from datetime import datetime
+import shutil
+from datetime import datetime, timedelta
 from pathlib import Path
+
+try:
+    import psycopg2
+    from psycopg2.pool import ThreadedConnectionPool
+    PSYCOPG2_OK = True
+except ImportError:
+    PSYCOPG2_OK = False
+
+try:
+    from passlib.context import CryptContext
+    PASSLIB_OK = True
+except ImportError:
+    PASSLIB_OK = False
+
+try:
+    from jose import JWTError, jwt
+    JOSE_OK = True
+except ImportError:
+    JOSE_OK = False
 
 app = FastAPI(title="Tax Sector Research Tool")
 security = HTTPBasic()
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
 
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY", "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")
 CLAUDIBLE_API_KEY  = os.getenv("CLAUDIBLE_API_KEY", "")
@@ -39,6 +66,40 @@ APP_USERNAME       = os.getenv("APP_USERNAME", "hoang")
 GDRIVE_FOLDER      = "Thanh-AI/TaxResearch"
 REPORTS_DIR        = Path("/app/reports")
 REPORTS_DIR.mkdir(exist_ok=True)
+
+# ─── DB / JWT config ──────────────────────────────────────────────────────────
+DB_HOST    = os.getenv("DB_HOST", "postgresql-pgwo0w8g0c0ccg840kw84gs8")
+DB_PORT    = int(os.getenv("DB_PORT", "5432"))
+DB_NAME    = os.getenv("DB_NAME", "sectortax")
+DB_USER    = os.getenv("DB_USER", "sectortax_user")
+DB_PASS    = os.getenv("DB_PASS", "SectorTax2026Secure")
+JWT_SECRET = os.getenv("JWT_SECRET", "sectortax-jwt-secret-change-in-prod")
+JWT_ALGORITHM    = "HS256"
+JWT_EXPIRE_HOURS = 24 * 7  # 7 days
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto") if PASSLIB_OK else None
+db_pool: "ThreadedConnectionPool | None" = None
+
+@app.on_event("startup")
+async def startup():
+    global db_pool
+    if PSYCOPG2_OK:
+        try:
+            db_pool = ThreadedConnectionPool(1, 10,
+                host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
+                user=DB_USER, password=DB_PASS,
+                connect_timeout=5)
+        except Exception as e:
+            print(f"[DB] Connection failed (fallback to env auth): {e}")
+
+def get_db_conn():
+    if db_pool:
+        return db_pool.getconn()
+    return None
+
+def release_db_conn(conn):
+    if db_pool and conn:
+        db_pool.putconn(conn)
 
 PERPLEXITY_URL = "https://api.perplexity.ai/chat/completions"
 
@@ -69,12 +130,110 @@ OUTPUT FORMAT — BẮT BUỘC:
 - Bắt đầu NGAY bằng thẻ h2 đầu tiên"""
 
 # ─── Auth ─────────────────────────────────────────────────────────────────────
-def check_auth(credentials: HTTPBasicCredentials = Depends(security)):
-    ok_u = secrets.compare_digest(credentials.username.encode(), APP_USERNAME.encode())
-    ok_p = secrets.compare_digest(credentials.password.encode(), APP_PASSWORD.encode())
-    if not (ok_u and ok_p):
-        raise HTTPException(status_code=401, headers={"WWW-Authenticate": "Basic realm='Tax Research'"})
-    return credentials.username
+
+def _create_jwt(data: dict) -> str:
+    payload = data.copy()
+    payload["exp"] = datetime.utcnow() + timedelta(hours=JWT_EXPIRE_HOURS)
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def _decode_jwt(token: str) -> dict | None:
+    if not JOSE_OK:
+        return None
+    try:
+        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except JWTError:
+        return None
+
+def _db_get_user(username: str) -> dict | None:
+    conn = get_db_conn()
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, username, email, password_hash, plan, is_active FROM users WHERE username=%s",
+                (username,)
+            )
+            row = cur.fetchone()
+            if row:
+                return {"id": row[0], "username": row[1], "email": row[2],
+                        "password_hash": row[3], "plan": row[4], "is_active": row[5]}
+            return None
+    except Exception:
+        return None
+    finally:
+        release_db_conn(conn)
+
+def _db_get_user_by_id(user_id: int) -> dict | None:
+    conn = get_db_conn()
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, username, email, plan, is_active FROM users WHERE id=%s",
+                (user_id,)
+            )
+            row = cur.fetchone()
+            if row:
+                return {"id": row[0], "username": row[1], "email": row[2],
+                        "plan": row[3], "is_active": row[4]}
+            return None
+    except Exception:
+        return None
+    finally:
+        release_db_conn(conn)
+
+def _verify_password(plain: str, hashed: str) -> bool:
+    if pwd_context:
+        try:
+            return pwd_context.verify(plain, hashed)
+        except Exception:
+            return False
+    return False
+
+async def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    credentials: HTTPBasicCredentials = Depends(security),
+) -> dict:
+    """JWT auth with fallback to env-var Basic auth when DB is unavailable."""
+    # 1) Try JWT Bearer token
+    if token and JOSE_OK:
+        payload = _decode_jwt(token)
+        if payload:
+            user_id = payload.get("sub")
+            if user_id:
+                # Try DB lookup
+                user = _db_get_user_by_id(int(user_id)) if db_pool else None
+                if user and user.get("is_active"):
+                    return user
+                # If DB down but token is valid, allow with basic info
+                if not db_pool:
+                    return {"id": 0, "username": payload.get("username", "user"),
+                            "plan": "free", "is_active": True}
+
+    # 2) Fallback: HTTP Basic Auth against env vars
+    if credentials:
+        ok_u = secrets.compare_digest(credentials.username.encode(), APP_USERNAME.encode())
+        ok_p = secrets.compare_digest(credentials.password.encode(), APP_PASSWORD.encode())
+        if ok_u and ok_p:
+            # Check DB for this user, or use synthetic user
+            user = _db_get_user(credentials.username) if db_pool else None
+            if user:
+                return user
+            return {"id": 0, "username": credentials.username, "plan": "admin", "is_active": True}
+
+    raise HTTPException(status_code=401,
+                        detail="Not authenticated",
+                        headers={"WWW-Authenticate": "Bearer"})
+
+# Keep check_auth as alias for backwards compat with existing endpoints
+async def check_auth(
+    token: str = Depends(oauth2_scheme),
+    credentials: HTTPBasicCredentials = Depends(security),
+) -> str:
+    user = await get_current_user(token=token, credentials=credentials)
+    return user["username"]
 
 # ─── Markdown → HTML ──────────────────────────────────────────────────────────
 def inline_md(text: str) -> str:
@@ -406,14 +565,24 @@ def sections_to_queries(sections: list, subject_context: str, report_date: datet
     return queries
 
 # ─── Save helpers ─────────────────────────────────────────────────────────────
-def save_report_local(subject: str, html: str, sources: list) -> str:
+def save_report_local(subject: str, html: str, sources: list,
+                      user_id: int = 0, mode: str = "sector") -> str:
     now = datetime.now()
     date_str = now.strftime("%Y%m%d")
     safe_name = re.sub(r'[^\w\s\-]', '', subject).strip()[:50]
-    # Find next sequential number for today
-    existing = list(REPORTS_DIR.glob(f"{date_str} - *.html"))
+
+    # Per-user subfolder when user_id > 0
+    if user_id:
+        user_dir = REPORTS_DIR / str(user_id)
+        user_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        user_dir = REPORTS_DIR
+
+    existing = list(user_dir.glob(f"{date_str} - *.html"))
     seq = len(existing) + 1
     fname = f"{date_str} - {safe_name} - {seq}.html"
+    storage_path = str(user_dir / fname)
+
     sources_html = ''.join(f'<li><a href="{u}">{u}</a></li>' for u in sources)
     full = f"""<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8">
 <title>Báo cáo thuế — {subject}</title>
@@ -442,18 +611,35 @@ tr:nth-child(even) td{{background:#e6f4ec}}
 <div class="footer"><strong>Nguồn tham khảo ({len(sources)} links):</strong><ol>{sources_html}</ol>
 Báo cáo tổng hợp tự động bởi AI. Mang tính tham khảo.</div>
 </body></html>"""
-    (REPORTS_DIR / fname).write_text(full, encoding="utf-8")
+    (user_dir / fname).write_text(full, encoding="utf-8")
+
+    # Insert DB record
+    if db_pool and user_id:
+        conn = get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO reports (user_id, filename, subject, mode, file_size, storage_path) "
+                    "VALUES (%s, %s, %s, %s, %s, %s)",
+                    (user_id, fname, subject, mode,
+                     (user_dir / fname).stat().st_size, storage_path)
+                )
+                conn.commit()
+        except Exception:
+            conn.rollback()
+        finally:
+            release_db_conn(conn)
+
     # Sync to GDrive (non-blocking background)
-    try:
-        import subprocess as _sp
-        _sp.Popen(
-            ["rclone", "copyto",
-             str(REPORTS_DIR / fname),
-             f"gdrive:Thanh-AI/TaxResearch/{fname}"],
-            stdout=_sp.DEVNULL, stderr=_sp.DEVNULL
-        )
-    except Exception:
-        pass  # GDrive sync failure must not break report saving
+    if shutil.which("rclone"):
+        try:
+            gdrive_path = f"gdrive:Thanh-AI/TaxResearch/user_{user_id}/{fname}"
+            subprocess.Popen(
+                ["rclone", "copyto", storage_path, gdrive_path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        except Exception:
+            pass
     return fname
 
 # ─── SSE stream ───────────────────────────────────────────────────────────────
@@ -511,7 +697,7 @@ async def claude_call_httpx(system: str, user_prompt: str, max_tokens: int = 800
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"]
 
-async def generate_report_stream(mode: str, subject: str, sections: list):
+async def generate_report_stream(mode: str, subject: str, sections: list, user_id: int = 0):
     try:
         report_date = datetime.now()
         yield f"data: {json.dumps({'type':'status','message':f'Bắt đầu nghiên cứu: {subject}...'},ensure_ascii=False)}\n\n"
@@ -687,7 +873,8 @@ DỮ LIỆU NGHIÊN CỨU:
                             yield f"data: {json.dumps({'type':'chunk','text':f'<h2>{sec_idx+1}. {sec_title}</h2><p><em>[Lỗi]</em></p>'},ensure_ascii=False)}\n\n"
 
         report_html = clean_html(report_html)
-        fname = save_report_local(subject, report_html, citations_all)
+        fname = save_report_local(subject, report_html, citations_all,
+                                  user_id=user_id, mode=mode)
 
         yield f"data: {json.dumps({'type':'citations','urls':citations_all},ensure_ascii=False)}\n\n"
         yield f"data: {json.dumps({'type':'done','filename':fname,'drive':False},ensure_ascii=False)}\n\n"
@@ -695,20 +882,100 @@ DỮ LIỆU NGHIÊN CỨU:
     except Exception as e:
         yield f"data: {json.dumps({'type':'error','message':str(e)},ensure_ascii=False)}\n\n"
 
+# ─── Auth endpoints ───────────────────────────────────────────────────────────
+
+@app.post("/auth/login")
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    username = form_data.username.strip()
+    password = form_data.password
+
+    # Try DB auth first
+    if db_pool:
+        user = _db_get_user(username)
+        if user and user.get("is_active") and _verify_password(password, user["password_hash"]):
+            token = _create_jwt({"sub": str(user["id"]), "username": user["username"]})
+            # Update last_login
+            conn = get_db_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE users SET last_login=NOW() WHERE id=%s", (user["id"],))
+                    conn.commit()
+            except Exception:
+                pass
+            finally:
+                release_db_conn(conn)
+            return {"access_token": token, "token_type": "bearer",
+                    "username": user["username"], "plan": user["plan"]}
+
+    # Fallback: env var auth
+    ok_u = secrets.compare_digest(username.encode(), APP_USERNAME.encode())
+    ok_p = secrets.compare_digest(password.encode(), APP_PASSWORD.encode())
+    if ok_u and ok_p:
+        token = _create_jwt({"sub": "0", "username": username})
+        return {"access_token": token, "token_type": "bearer",
+                "username": username, "plan": "admin"}
+
+    raise HTTPException(status_code=401, detail="Tên đăng nhập hoặc mật khẩu không đúng")
+
+
+@app.post("/auth/register")
+async def register(request: Request):
+    body = await request.json()
+    username = body.get("username", "").strip()
+    password = body.get("password", "").strip()
+    email    = body.get("email", "").strip()
+
+    if not username or not password:
+        raise HTTPException(400, "Thiếu username hoặc password")
+    if len(password) < 6:
+        raise HTTPException(400, "Mật khẩu phải ít nhất 6 ký tự")
+
+    if not db_pool or not pwd_context:
+        raise HTTPException(503, "Đăng ký chưa khả dụng (DB chưa kết nối)")
+
+    hashed = pwd_context.hash(password)
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO users (username, email, password_hash, plan) VALUES (%s,%s,%s,'free') RETURNING id",
+                (username, email, hashed)
+            )
+            user_id = cur.fetchone()[0]
+            conn.commit()
+        token = _create_jwt({"sub": str(user_id), "username": username})
+        return {"access_token": token, "token_type": "bearer",
+                "username": username, "plan": "free"}
+    except Exception as e:
+        conn.rollback()
+        if "unique" in str(e).lower() or "duplicate" in str(e).lower():
+            raise HTTPException(409, "Tên đăng nhập đã tồn tại")
+        raise HTTPException(500, f"Lỗi đăng ký: {e}")
+    finally:
+        release_db_conn(conn)
+
+
+@app.get("/auth/me")
+async def me(user: dict = Depends(get_current_user)):
+    return {"username": user["username"], "plan": user.get("plan","free"),
+            "id": user.get("id", 0)}
+
+
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 async def index(user: str = Depends(check_auth)):
     return HTML_PAGE
 
 @app.post("/stream")
-async def stream_report(request_body: dict, user: str = Depends(check_auth)):
+async def stream_report(request_body: dict, user: dict = Depends(get_current_user)):
     mode     = request_body.get("mode", "sector")
     subject  = request_body.get("subject", "")
     sections = request_body.get("sections", [])
     if not subject or not sections:
         raise HTTPException(400, "Missing subject or sections")
+    user_id = user.get("id", 0)
     return StreamingResponse(
-        generate_report_stream(mode, subject, sections),
+        generate_report_stream(mode, subject, sections, user_id=user_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-transform",
@@ -724,41 +991,128 @@ async def get_default_sections(mode: str = "sector", user: str = Depends(check_a
     return JSONResponse(data)
 
 @app.get("/reports")
-async def list_reports(user: str = Depends(check_auth)):
-    import subprocess as _sp, time as _time
-    # Pull any GDrive reports not in local (sync GDrive → local)
-    try:
-        _sp.run(
-            ["rclone", "copy", "gdrive:Thanh-AI/TaxResearch/", str(REPORTS_DIR)],
-            timeout=15, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL
-        )
-    except Exception:
-        pass
-    files = sorted(REPORTS_DIR.glob("*.html"), key=lambda f: f.stat().st_mtime, reverse=True)
-    return JSONResponse([{"name":f.name,"size":f.stat().st_size,"mtime":f.stat().st_mtime,"url":f"/report/{f.name}"} for f in files[:100]])
+async def list_reports(user: dict = Depends(get_current_user)):
+    user_id = user.get("id", 0)
+    # Try DB query first
+    if db_pool and user_id:
+        conn = get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT filename, subject, file_size, storage_path, "
+                    "EXTRACT(EPOCH FROM created_at) as mtime "
+                    "FROM reports WHERE user_id=%s ORDER BY created_at DESC LIMIT 100",
+                    (user_id,)
+                )
+                rows = cur.fetchall()
+                if rows:
+                    result = []
+                    for r in rows:
+                        fname, subject, fsize, spath, mtime = r
+                        result.append({
+                            "name": fname, "size": fsize or 0,
+                            "mtime": float(mtime or 0),
+                            "url": f"/report/{fname}",
+                            "subject": subject or fname
+                        })
+                    return JSONResponse(result)
+        except Exception:
+            pass
+        finally:
+            release_db_conn(conn)
+
+    # Fallback: filesystem (per-user dir or root)
+    if user_id:
+        user_dir = REPORTS_DIR / str(user_id)
+        user_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        user_dir = REPORTS_DIR
+    files = sorted(user_dir.glob("*.html"), key=lambda f: f.stat().st_mtime, reverse=True)
+    return JSONResponse([{
+        "name": f.name, "size": f.stat().st_size,
+        "mtime": f.stat().st_mtime, "url": f"/report/{f.name}"
+    } for f in files[:100]])
+
+
+def _find_report_path(fname: str, user_id: int) -> "Path | None":
+    """Find report file, checking user dir then root reports dir."""
+    if not fname.endswith(".html"):
+        return None
+    # User-specific subfolder first
+    if user_id:
+        p = REPORTS_DIR / str(user_id) / fname
+        if p.exists():
+            return p
+    # Legacy root location
+    p = REPORTS_DIR / fname
+    if p.exists():
+        return p
+    return None
+
 
 @app.delete("/report/{fname}")
-async def delete_report(fname: str, user: str = Depends(check_auth)):
-    path = REPORTS_DIR / fname
-    if not path.exists() or not path.name.endswith(".html"):
+async def delete_report(fname: str, user: dict = Depends(get_current_user)):
+    user_id = user.get("id", 0)
+    path = _find_report_path(fname, user_id)
+    if not path:
         raise HTTPException(404)
-    path.unlink()
-    # Also delete from GDrive
-    try:
-        import subprocess as _sp
-        _sp.Popen(
-            ["rclone", "deletefile", f"gdrive:Thanh-AI/TaxResearch/{fname}"],
-            stdout=_sp.DEVNULL, stderr=_sp.DEVNULL
-        )
-    except Exception:
-        pass
+
+    # Access control: verify ownership via DB
+    if db_pool and user_id:
+        conn = get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM reports WHERE filename=%s AND user_id=%s",
+                            (fname, user_id))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(403, "Access denied")
+                cur.execute("DELETE FROM reports WHERE filename=%s AND user_id=%s",
+                            (fname, user_id))
+                conn.commit()
+        except HTTPException:
+            raise
+        except Exception:
+            conn.rollback()
+        finally:
+            release_db_conn(conn)
+
+    path.unlink(missing_ok=True)
+    if shutil.which("rclone"):
+        try:
+            subprocess.Popen(
+                ["rclone", "deletefile",
+                 f"gdrive:Thanh-AI/TaxResearch/user_{user_id}/{fname}"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        except Exception:
+            pass
     return JSONResponse({"ok": True})
 
+
 @app.get("/report/{fname}", response_class=HTMLResponse)
-async def get_report(fname: str, user: str = Depends(check_auth)):
-    path = REPORTS_DIR / fname
-    if not path.exists() or not path.name.endswith(".html"):
+async def get_report(fname: str, user: dict = Depends(get_current_user)):
+    user_id = user.get("id", 0)
+    path = _find_report_path(fname, user_id)
+    if not path:
         raise HTTPException(404)
+
+    # Access control via DB (soft check — falls back to allow if DB unavailable)
+    if db_pool and user_id:
+        conn = get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM reports WHERE filename=%s AND user_id=%s",
+                            (fname, user_id))
+                if not cur.fetchone():
+                    raise HTTPException(403, "Access denied")
+        except HTTPException:
+            raise
+        except Exception:
+            pass  # DB error: allow access
+        finally:
+            release_db_conn(conn)
+
     return HTMLResponse(path.read_text(encoding="utf-8"))
 
 
@@ -819,156 +1173,120 @@ async def export_docx(request_body: dict, user: str = Depends(check_auth)):
     from fastapi.responses import Response
     html    = request_body.get("html", "")
     subject = request_body.get("subject", "Báo cáo")
-    if not html:
-        raise HTTPException(400, "Missing html")
+    if not html or not html.strip():
+        raise HTTPException(400, "Không có nội dung báo cáo để xuất.")
     if not DOCX_OK:
-        raise HTTPException(503, "python-docx not installed")
+        raise HTTPException(503, "python-docx không khả dụng.")
+    if not BS4_OK:
+        raise HTTPException(503, "BeautifulSoup không khả dụng.")
 
-    doc = DocxDocument()
-    # Title
-    title_para = doc.add_heading(f"Phân Tích Thuế — {subject}", 0)
-    title_para.runs[0].font.color.rgb = RGBColor(0x02, 0x8a, 0x39)
-    doc.add_paragraph(f"Ngày tạo: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
-    doc.add_paragraph("Nguồn: Perplexity Sonar + Claude AI | taxsector.gpt4vn.com")
-    doc.add_paragraph()
+    try:
 
-    # Parse HTML
-    from html.parser import HTMLParser
-    class DocxBuilder(HTMLParser):
-        def __init__(self):
-            super().__init__()
-            self.current_tag = None
-            self.current_para = None
-            self.text_buf = ""
-            self.skip_tags = {"script","style","a"}
-            self.in_skip = False
-            self.in_table = False
-            self.table_rows = []
-            self.current_row = []
-            self.is_header_row = False
+        doc = DocxDocument()
+        # Title
+        title_para = doc.add_heading(f"Phân Tích Thuế — {subject}", 0)
+        title_para.runs[0].font.color.rgb = RGBColor(0x02, 0x8a, 0x39)
+        doc.add_paragraph(f"Ngày tạo: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+        doc.add_paragraph("Nguồn: Perplexity Sonar + Claude AI | taxsector.gpt4vn.com")
+        doc.add_paragraph()
 
-        def handle_starttag(self, tag, attrs):
-            self.current_tag = tag
-            if tag in self.skip_tags:
-                self.in_skip = True
-            elif tag == "table":
-                self.in_table = True
-                self.table_rows = []
-            elif tag == "tr":
-                self.current_row = []
-            elif tag in ("th",):
-                self.is_header_row = True
-
-        def handle_endtag(self, tag):
-            if tag in self.skip_tags:
+        # Parse HTML
+        from html.parser import HTMLParser
+        class DocxBuilder(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.current_tag = None
+                self.current_para = None
+                self.text_buf = ""
+                self.skip_tags = {"script","style","a"}
                 self.in_skip = False
-            elif tag in ("h2","h3","h4","p","li"):
-                t = self.text_buf.strip()
-                if t:
-                    if self.current_tag == "h2" or tag == "h2":
-                        h = doc.add_heading(t, level=1)
-                        h.runs[0].font.color.rgb = RGBColor(0x02, 0x8a, 0x39)
-                    elif tag == "h3":
-                        h = doc.add_heading(t, level=2)
-                        h.runs[0].font.color.rgb = RGBColor(0x01, 0x6d, 0x2d)
-                    elif tag == "h4":
-                        doc.add_heading(t, level=3)
-                    elif tag == "li":
-                        p = doc.add_paragraph(t, style="List Bullet")
-                        p.runs[0].font.size = Pt(11) if p.runs else None
-                    else:
-                        p = doc.add_paragraph(t)
-                        if p.runs:
-                            p.runs[0].font.size = Pt(11)
-                self.text_buf = ""
-            elif tag in ("td","th"):
-                self.current_row.append(self.text_buf.strip())
-                self.text_buf = ""
-            elif tag == "tr":
-                if self.current_row:
-                    self.table_rows.append((self.current_row, self.is_header_row))
-                self.is_header_row = False
-                self.current_row = []
-            elif tag == "table":
                 self.in_table = False
-                if self.table_rows:
-                    max_cols = max(len(r[0]) for r in self.table_rows)
-                    if max_cols > 0:
-                        tbl = doc.add_table(rows=len(self.table_rows), cols=max_cols)
-                        tbl.style = "Table Grid"
-                        for ri, (row_data, is_hdr) in enumerate(self.table_rows):
-                            for ci, cell_text in enumerate(row_data[:max_cols]):
-                                cell = tbl.rows[ri].cells[ci]
-                                cell.text = cell_text
-                                if is_hdr:
-                                    for run in cell.paragraphs[0].runs:
-                                        run.font.bold = True
-                                        run.font.color.rgb = RGBColor(0x02, 0x8a, 0x39)
-                        doc.add_paragraph()
                 self.table_rows = []
+                self.current_row = []
+                self.is_header_row = False
 
-        def handle_data(self, data):
-            if not self.in_skip and not self.in_table or self.current_tag in ("td","th"):
-                self.text_buf += data
+            def handle_starttag(self, tag, attrs):
+                self.current_tag = tag
+                if tag in self.skip_tags:
+                    self.in_skip = True
+                elif tag == "table":
+                    self.in_table = True
+                    self.table_rows = []
+                elif tag == "tr":
+                    self.current_row = []
+                elif tag in ("th",):
+                    self.is_header_row = True
 
-    builder = DocxBuilder()
-    builder.feed(html)
+            def handle_endtag(self, tag):
+                if tag in self.skip_tags:
+                    self.in_skip = False
+                elif tag in ("h2","h3","h4","p","li"):
+                    t = self.text_buf.strip()
+                    if t:
+                        if self.current_tag == "h2" or tag == "h2":
+                            h = doc.add_heading(t, level=1)
+                            h.runs[0].font.color.rgb = RGBColor(0x02, 0x8a, 0x39)
+                        elif tag == "h3":
+                            h = doc.add_heading(t, level=2)
+                            h.runs[0].font.color.rgb = RGBColor(0x01, 0x6d, 0x2d)
+                        elif tag == "h4":
+                            doc.add_heading(t, level=3)
+                        elif tag == "li":
+                            p = doc.add_paragraph(t, style="List Bullet")
+                            p.runs[0].font.size = Pt(11) if p.runs else None
+                        else:
+                            p = doc.add_paragraph(t)
+                            if p.runs:
+                                p.runs[0].font.size = Pt(11)
+                    self.text_buf = ""
+                elif tag in ("td","th"):
+                    self.current_row.append(self.text_buf.strip())
+                    self.text_buf = ""
+                elif tag == "tr":
+                    if self.current_row:
+                        self.table_rows.append((self.current_row, self.is_header_row))
+                    self.is_header_row = False
+                    self.current_row = []
+                elif tag == "table":
+                    self.in_table = False
+                    if self.table_rows:
+                        max_cols = max(len(r[0]) for r in self.table_rows)
+                        if max_cols > 0:
+                            tbl = doc.add_table(rows=len(self.table_rows), cols=max_cols)
+                            tbl.style = "Table Grid"
+                            for ri, (row_data, is_hdr) in enumerate(self.table_rows):
+                                for ci, cell_text in enumerate(row_data[:max_cols]):
+                                    cell = tbl.rows[ri].cells[ci]
+                                    cell.text = cell_text
+                                    if is_hdr:
+                                        for run in cell.paragraphs[0].runs:
+                                            run.font.bold = True
+                                            run.font.color.rgb = RGBColor(0x02, 0x8a, 0x39)
+                            doc.add_paragraph()
+                    self.table_rows = []
 
-    buf = BytesIO()
-    doc.save(buf)
-    buf.seek(0)
-    safe_name = re.sub(r'[^\w\s-]', '', subject).strip()[:40]
-    filename = f"TaxReport_{safe_name}_{datetime.now().strftime('%Y%m%d')}.docx"
-    return Response(
-        content=buf.read(),
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
-    )
+            def handle_data(self, data):
+                if not self.in_skip and not self.in_table or self.current_tag in ("td","th"):
+                    self.text_buf += data
 
+        builder = DocxBuilder()
+        builder.feed(html)
 
-@app.post("/validate-subject")
-async def validate_subject(request_body: dict, user: str = Depends(check_auth)):
-    """Quick Perplexity check: does this company/sector actually exist?"""
-    subject = request_body.get("subject", "").strip()
-    mode    = request_body.get("mode", "sector")
-    if not subject:
-        raise HTTPException(400, "Missing subject")
-    if not PERPLEXITY_API_KEY:
-        return JSONResponse({"valid": True, "suggestion": ""})  # skip if no key
+        buf = BytesIO()
+        doc.save(buf)
+        buf.seek(0)
+        safe_name = re.sub(r'[^\w\s-]', '', subject).strip()[:40]
+        filename = f"TaxReport_{safe_name}_{datetime.now().strftime('%Y%m%d')}.docx"
+        return Response(
+            content=buf.read(),
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Lỗi tạo DOCX: {str(e)}")
 
-    entity = "công ty" if mode == "company" else "ngành/sector kinh doanh"
-    query = (
-        f'Is "{subject}" a real, well-known {entity} in Vietnam or internationally? '
-        f'Reply in JSON only: {{"exists": true/false, "canonical_name": "correct name or empty", "note": "short explanation in Vietnamese"}}'
-    )
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        try:
-            resp = await client.post(
-                "https://api.perplexity.ai/chat/completions",
-                headers={"Authorization": f"Bearer {PERPLEXITY_API_KEY}", "Content-Type": "application/json"},
-                json={
-                    "model": "sonar",
-                    "max_tokens": 150,
-                    "temperature": 0.1,
-                    "messages": [
-                        {"role": "system", "content": "You are a factual validator. Reply ONLY with valid JSON, no markdown."},
-                        {"role": "user",   "content": query}
-                    ]
-                }
-            )
-            resp.raise_for_status()
-            raw = resp.json()["choices"][0]["message"]["content"].strip()
-            # Strip markdown code blocks if present
-            raw = re.sub(r"^```json\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
-            data = json.loads(raw)
-            return JSONResponse({
-                "valid":      bool(data.get("exists", True)),
-                "canonical":  data.get("canonical_name", ""),
-                "note":       data.get("note", "")
-            })
-        except Exception as e:
-            # On any error, allow the search to proceed
-            return JSONResponse({"valid": True, "canonical": "", "note": str(e)})
 
 # ─── Frontend ─────────────────────────────────────────────────────────────────
 HTML_PAGE = r"""<!DOCTYPE html>
@@ -1032,6 +1350,55 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </style>
 </head>
 <body class="bg-gray-50 min-h-screen">
+
+<!-- Login page overlay -->
+<div id="login-page" class="hidden fixed inset-0 bg-gray-50 z-[200] flex items-center justify-center p-4">
+  <div class="bg-white rounded-2xl shadow-xl w-full max-w-sm p-8">
+    <div class="text-center mb-6">
+      <div class="text-4xl mb-2">🔍</div>
+      <h1 class="text-xl font-bold text-gray-800">Tax Sector Research</h1>
+      <p class="text-sm text-gray-500 mt-1">Đăng nhập để tiếp tục</p>
+    </div>
+    <div id="login-err" class="hidden mb-4 p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700"></div>
+    <div id="register-err" class="hidden mb-4 p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700"></div>
+
+    <!-- Login form -->
+    <div id="login-form-wrap">
+      <input id="login-user" type="text" placeholder="Tên đăng nhập" autocomplete="username"
+        class="w-full border border-gray-200 rounded-lg px-4 py-2.5 text-sm mb-3 focus:outline-none focus:ring-2 focus:ring-green-400">
+      <input id="login-pass" type="password" placeholder="Mật khẩu" autocomplete="current-password"
+        class="w-full border border-gray-200 rounded-lg px-4 py-2.5 text-sm mb-4 focus:outline-none focus:ring-2 focus:ring-green-400"
+        onkeydown="if(event.key==='Enter')doLogin()">
+      <button onclick="doLogin()" id="btn-login"
+        class="w-full bg-green-600 hover:bg-green-700 text-white font-semibold py-2.5 rounded-lg text-sm transition-colors">
+        Đăng nhập
+      </button>
+      <p class="text-center text-xs text-gray-400 mt-4">
+        Chưa có tài khoản?
+        <a onclick="showRegister()" class="text-green-600 hover:underline cursor-pointer">Đăng ký</a>
+      </p>
+    </div>
+
+    <!-- Register form -->
+    <div id="register-form-wrap" class="hidden">
+      <input id="reg-user" type="text" placeholder="Tên đăng nhập" autocomplete="username"
+        class="w-full border border-gray-200 rounded-lg px-4 py-2.5 text-sm mb-3 focus:outline-none focus:ring-2 focus:ring-green-400">
+      <input id="reg-email" type="email" placeholder="Email (tuỳ chọn)"
+        class="w-full border border-gray-200 rounded-lg px-4 py-2.5 text-sm mb-3 focus:outline-none focus:ring-2 focus:ring-green-400">
+      <input id="reg-pass" type="password" placeholder="Mật khẩu (≥6 ký tự)" autocomplete="new-password"
+        class="w-full border border-gray-200 rounded-lg px-4 py-2.5 text-sm mb-4 focus:outline-none focus:ring-2 focus:ring-green-400"
+        onkeydown="if(event.key==='Enter')doRegister()">
+      <button onclick="doRegister()" id="btn-register"
+        class="w-full bg-green-600 hover:bg-green-700 text-white font-semibold py-2.5 rounded-lg text-sm transition-colors">
+        Tạo tài khoản
+      </button>
+      <p class="text-center text-xs text-gray-400 mt-4">
+        Đã có tài khoản?
+        <a onclick="showLogin()" class="text-green-600 hover:underline cursor-pointer">Đăng nhập</a>
+      </p>
+    </div>
+  </div>
+</div>
 
 <!-- Reading progress bar -->
 <div id="reading-progress"></div>
@@ -1169,6 +1536,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <h2 class="font-bold">📂 Báo cáo đã lưu</h2>
       <button onclick="closeReports()" class="text-green-200 hover:text-white text-xl leading-none">×</button>
     </div>
+    <div class="px-4 pt-3 pb-1">
+      <input type="text" id="reports-search"
+        placeholder="🔍 Tìm theo tên báo cáo..."
+        class="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-400"
+        oninput="filterReports(this.value)">
+    </div>
     <div id="reports-list" class="flex-1 overflow-y-auto p-4 space-y-2"></div>
   </div>
 </div>
@@ -1176,15 +1549,115 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <script>
 // ── State ────────────────────────────────────────────────────────────────────
 let mode = 'sector';
-// ── Auth helper — same-origin credentials ────────────────────────────────────
-const AUTH_CREDS = btoa('hoang:taxsector2026');
+
+// ── Auth — JWT stored in localStorage ────────────────────────────────────────
+function getToken() { return localStorage.getItem('sectortax_token') || ''; }
+function setToken(t, username) {
+  localStorage.setItem('sectortax_token', t);
+  if(username) localStorage.setItem('sectortax_user', username);
+}
+function clearToken() {
+  localStorage.removeItem('sectortax_token');
+  localStorage.removeItem('sectortax_user');
+}
+
 function apiFetch(url, opts={}) {
-  // Use credentials:'include' for same-origin Basic Auth
-  opts.credentials = 'include';
-  // Also set Authorization header as fallback
   if(!opts.headers) opts.headers = {};
-  opts.headers['Authorization'] = 'Basic ' + AUTH_CREDS;
-  return fetch(url, opts);
+  const t = getToken();
+  if(t) {
+    opts.headers['Authorization'] = 'Bearer ' + t;
+  } else {
+    // Fallback Basic auth for legacy
+    opts.headers['Authorization'] = 'Basic ' + btoa('hoang:taxsector2026');
+  }
+  return fetch(url, opts).then(resp => {
+    if(resp.status === 401) {
+      clearToken();
+      showLoginPage();
+    }
+    return resp;
+  });
+}
+
+function showLoginPage() {
+  document.getElementById('login-page').classList.remove('hidden');
+}
+function hideLoginPage() {
+  document.getElementById('login-page').classList.add('hidden');
+}
+function showLogin() {
+  document.getElementById('login-form-wrap').classList.remove('hidden');
+  document.getElementById('register-form-wrap').classList.add('hidden');
+  document.getElementById('login-err').classList.add('hidden');
+}
+function showRegister() {
+  document.getElementById('login-form-wrap').classList.add('hidden');
+  document.getElementById('register-form-wrap').classList.remove('hidden');
+  document.getElementById('register-err').classList.add('hidden');
+}
+
+async function doLogin() {
+  const username = document.getElementById('login-user').value.trim();
+  const password = document.getElementById('login-pass').value;
+  const errEl = document.getElementById('login-err');
+  errEl.classList.add('hidden');
+  if(!username || !password) { errEl.textContent='Vui lòng nhập đầy đủ.'; errEl.classList.remove('hidden'); return; }
+  const btn = document.getElementById('btn-login');
+  btn.textContent = '⏳ Đang đăng nhập...'; btn.disabled = true;
+  try {
+    const fd = new FormData();
+    fd.append('username', username); fd.append('password', password);
+    const r = await fetch('/auth/login', {method:'POST', body: fd});
+    if(r.ok) {
+      const data = await r.json();
+      setToken(data.access_token, data.username);
+      hideLoginPage();
+      initApp();
+    } else {
+      const err = await r.json().catch(()=>({detail:'Lỗi đăng nhập'}));
+      errEl.textContent = err.detail || 'Sai tên đăng nhập hoặc mật khẩu';
+      errEl.classList.remove('hidden');
+    }
+  } catch(e) {
+    errEl.textContent = 'Lỗi kết nối: ' + e.message;
+    errEl.classList.remove('hidden');
+  } finally { btn.textContent='Đăng nhập'; btn.disabled=false; }
+}
+
+async function doRegister() {
+  const username = document.getElementById('reg-user').value.trim();
+  const password = document.getElementById('reg-pass').value;
+  const email    = document.getElementById('reg-email').value.trim();
+  const errEl = document.getElementById('register-err');
+  errEl.classList.add('hidden');
+  if(!username || !password) { errEl.textContent='Vui lòng nhập đầy đủ.'; errEl.classList.remove('hidden'); return; }
+  const btn = document.getElementById('btn-register');
+  btn.textContent = '⏳ Đang tạo...'; btn.disabled = true;
+  try {
+    const r = await fetch('/auth/register', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({username, password, email})
+    });
+    if(r.ok) {
+      const data = await r.json();
+      setToken(data.access_token, data.username);
+      hideLoginPage();
+      initApp();
+    } else {
+      const err = await r.json().catch(()=>({detail:'Lỗi đăng ký'}));
+      errEl.textContent = err.detail || 'Không tạo được tài khoản';
+      errEl.classList.remove('hidden');
+    }
+  } catch(e) {
+    errEl.textContent = 'Lỗi: ' + e.message;
+    errEl.classList.remove('hidden');
+  } finally { btn.textContent='Tạo tài khoản'; btn.disabled=false; }
+}
+
+function initApp() {
+  // Called after successful login or if token already exists
+  loadDefaultSections();
+  loadReportsList().catch(()=>{});
 }
 let sections = [];
 let isDone = false;
@@ -1555,7 +2028,11 @@ async function exportDocx(){
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify({html, subject})
     });
-    if(!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    if(!resp.ok) {
+      const errText = await resp.text();
+      alert(`Không xuất được DOCX: ${errText}`);
+      return;
+    }
     const blob = await resp.blob();
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -1572,38 +2049,64 @@ async function showReports(){
   await loadReportsList();
 }
 
+let allReportsData = [];
+
+const renderReportRow = f => {
+  const displayName = (f.subject || f.name).replace(/\.html$/, '');
+  const datePart = f.name.slice(0,8).replace(/(\d{4})(\d{2})(\d{2})/,'$3/$2/$1');
+  const url = f.url || `/report/${f.name}`;
+  return `
+  <div class="flex items-center gap-2 bg-gray-50 p-3 rounded-xl border border-gray-200">
+    <div class="flex-1 min-w-0">
+      <div class="text-sm font-medium text-gray-800 truncate">${displayName}</div>
+      <div class="text-xs text-gray-400">${datePart} · ${((f.size||0)/1024).toFixed(0)} KB</div>
+    </div>
+    <button onclick="openReportInApp('${f.name}')" class="text-xs bg-green-50 text-green-700 hover:bg-green-100 border border-green-200 px-2 py-1.5 rounded-lg font-medium flex-shrink-0">📂 Mở</button>
+    <a href="${url}" target="_blank" class="text-xs text-gray-500 hover:text-gray-700 px-2 py-1.5 rounded-lg font-medium flex-shrink-0" title="Mở tab mới">↗</a>
+    <button onclick="deleteReport('${f.name}')" class="text-xs text-gray-400 hover:text-red-500 hover:bg-red-50 px-2 py-1.5 rounded-lg flex-shrink-0 transition-colors" title="Xóa báo cáo">🗑</button>
+  </div>`;
+};
+
+function renderReportList(data, showAll=false) {
+  const list = document.getElementById('reports-list');
+  if(!data.length){ list.innerHTML='<p class="text-sm text-gray-400">Chưa có báo cáo nào.</p>'; return; }
+  const LIMIT = 10;
+  const display = showAll ? data : data.slice(0, LIMIT);
+  let html = display.map(renderReportRow).join('');
+  if(!showAll && data.length > LIMIT){
+    html += `<div class="text-center pt-2">
+      <button onclick="loadReportsList(true)" class="text-xs text-green-700 hover:text-green-900 border border-green-200 hover:bg-green-50 px-4 py-2 rounded-lg font-medium">
+        📂 Xem thêm ${data.length - LIMIT} báo cáo
+      </button></div>`;
+  }
+  list.innerHTML = html;
+}
+
+function filterReports(query) {
+  if(!query.trim()) {
+    renderReportList(allReportsData, false);
+    return;
+  }
+  const q = query.toLowerCase();
+  const filtered = allReportsData.filter(f =>
+    (f.subject || f.name || '').toLowerCase().includes(q) ||
+    f.name.toLowerCase().includes(q)
+  );
+  renderReportList(filtered, true);
+}
+
 async function loadReportsList(showAll=false){
   const list=document.getElementById('reports-list');
   list.innerHTML='<p class="text-sm text-gray-400">Đang tải...</p>';
+  const searchEl = document.getElementById('reports-search');
+  if(searchEl) searchEl.value = '';
   try{
-    const data=await(await apiFetch('/reports')).json();
-    // Sort newest first
+    const resp = await apiFetch('/reports');
+    if(!resp || !resp.ok) { list.innerHTML='<p class="text-sm text-red-400">Không tải được danh sách.</p>'; return; }
+    const data = await resp.json();
     data.sort((a,b)=>(b.mtime||0)-(a.mtime||0));
-    if(!data.length){ list.innerHTML='<p class="text-sm text-gray-400">Chưa có báo cáo nào.</p>'; return; }
-    const LIMIT = 10;
-    const display = showAll ? data : data.slice(0, LIMIT);
-    const renderRow = f => {
-      const displayName = f.name.replace(/\.html$/, '');
-      const datePart = f.name.slice(0,8).replace(/(\d{4})(\d{2})(\d{2})/,'$3/$2/$1');
-      return `
-      <div class="flex items-center gap-2 bg-gray-50 p-3 rounded-xl border border-gray-200" id="row-${encodeURIComponent(f.name)}">
-        <div class="flex-1 min-w-0">
-          <div class="text-sm font-medium text-gray-800 truncate">${displayName}</div>
-          <div class="text-xs text-gray-400">${datePart} · ${(f.size/1024).toFixed(0)} KB</div>
-        </div>
-        <button onclick="openReportInApp('${f.name}')" class="text-xs bg-green-50 text-green-700 hover:bg-green-100 border border-green-200 px-2 py-1.5 rounded-lg font-medium flex-shrink-0">📂 Mở</button>
-        <a href="${f.url}" target="_blank" class="text-xs text-gray-500 hover:text-gray-700 px-2 py-1.5 rounded-lg font-medium flex-shrink-0" title="Mở tab mới">↗</a>
-        <button onclick="deleteReport('${f.name}')" class="text-xs text-gray-400 hover:text-red-500 hover:bg-red-50 px-2 py-1.5 rounded-lg flex-shrink-0 transition-colors" title="Xóa báo cáo">🗑</button>
-      </div>`;
-    };
-    let html = display.map(renderRow).join('');
-    if(!showAll && data.length > LIMIT){
-      html += `<div class="text-center pt-2">
-        <button onclick="loadReportsList(true)" class="text-xs text-green-700 hover:text-green-900 border border-green-200 hover:bg-green-50 px-4 py-2 rounded-lg font-medium">
-          Xem thêm ${data.length - LIMIT} báo cáo...
-        </button></div>`;
-    }
-    list.innerHTML = html;
+    allReportsData = data;
+    renderReportList(data, showAll);
   } catch(e){ list.innerHTML=`<p class="text-sm text-red-500">Lỗi: ${e.message}</p>`; }
 }
 
@@ -1839,11 +2342,23 @@ async function openAppendix(){
 }
 
 // ── Init ─────────────────────────────────────────────────────────────────────
-loadDefaultSections();
-// Auto-load reports list on page init (show modal-ready data in background)
 window.addEventListener('DOMContentLoaded', () => {
-  // Pre-fetch reports so modal opens instantly
-  loadReportsList().catch(()=>{});
+  const token = getToken();
+  if(token) {
+    // Verify token is still valid
+    apiFetch('/auth/me').then(r => {
+      if(r && r.ok) {
+        initApp();
+      } else {
+        showLoginPage();
+      }
+    }).catch(() => {
+      // If /auth/me fails (network), still try to use cached token
+      initApp();
+    });
+  } else {
+    showLoginPage();
+  }
 });
 </script>
 </body>
