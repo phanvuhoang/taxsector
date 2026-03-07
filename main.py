@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials, OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 # Claude via httpx directly (no SDK timeout issues)
 from io import BytesIO
 try:
@@ -53,7 +53,6 @@ except ImportError:
     JOSE_OK = False
 
 app = FastAPI(title="Tax Sector Research Tool")
-security = HTTPBasic()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
 
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY", "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")
@@ -89,8 +88,47 @@ async def startup():
                 host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
                 user=DB_USER, password=DB_PASS,
                 connect_timeout=5)
+            print("[DB] Connection pool created")
+            # Seed admin user if not exists
+            _seed_admin_user()
         except Exception as e:
             print(f"[DB] Connection failed (fallback to env auth): {e}")
+
+def _seed_admin_user():
+    """Ensure admin user (hoang) exists in DB with a valid bcrypt hash."""
+    if not db_pool or not pwd_context:
+        return
+    admin_user = os.getenv("APP_USERNAME", "hoang")
+    admin_pass = os.getenv("APP_PASSWORD", "taxsector2026")
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM users WHERE username=%s", (admin_user,))
+            if not cur.fetchone():
+                hashed = pwd_context.hash(admin_pass)
+                cur.execute(
+                    "INSERT INTO users (username, email, password_hash, plan, is_active) "
+                    "VALUES (%s, %s, %s, 'admin', true) ON CONFLICT (username) DO NOTHING",
+                    (admin_user, f"{admin_user}@sectortax.local", hashed)
+                )
+                conn.commit()
+                print(f"[DB] Seeded admin user: {admin_user}")
+            else:
+                # Update hash in case passlib version changed
+                hashed = pwd_context.hash(admin_pass)
+                cur.execute(
+                    "UPDATE users SET password_hash=%s WHERE username=%s",
+                    (hashed, admin_user)
+                )
+                conn.commit()
+    except Exception as e:
+        print(f"[DB] Seed admin failed: {e}")
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            release_db_conn(conn)
 
 def get_db_conn():
     if db_pool:
@@ -192,48 +230,46 @@ def _verify_password(plain: str, hashed: str) -> bool:
             return False
     return False
 
-async def get_current_user(
-    token: str = Depends(oauth2_scheme),
-    credentials: HTTPBasicCredentials = Depends(security),
-) -> dict:
-    """JWT auth with fallback to env-var Basic auth when DB is unavailable."""
-    # 1) Try JWT Bearer token
-    if token and JOSE_OK:
-        payload = _decode_jwt(token)
-        if payload:
-            user_id = payload.get("sub")
-            if user_id:
-                # Try DB lookup
-                user = _db_get_user_by_id(int(user_id)) if db_pool else None
-                if user and user.get("is_active"):
-                    return user
-                # If DB down but token is valid, allow with basic info
-                if not db_pool:
-                    return {"id": 0, "username": payload.get("username", "user"),
-                            "plan": "free", "is_active": True}
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
+    """Validate JWT token and return user dict."""
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated",
+                            headers={"WWW-Authenticate": "Bearer"})
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        username = payload.get("username")
+        if not username:
+            raise HTTPException(401, "Invalid token")
+    except JWTError:
+        raise HTTPException(401, "Invalid or expired token",
+                            headers={"WWW-Authenticate": "Bearer"})
 
-    # 2) Fallback: HTTP Basic Auth against env vars
-    if credentials:
-        ok_u = secrets.compare_digest(credentials.username.encode(), APP_USERNAME.encode())
-        ok_p = secrets.compare_digest(credentials.password.encode(), APP_PASSWORD.encode())
-        if ok_u and ok_p:
-            # Check DB for this user, or use synthetic user
-            user = _db_get_user(credentials.username) if db_pool else None
-            if user:
-                return user
-            return {"id": 0, "username": credentials.username, "plan": "admin", "is_active": True}
+    # Try DB first
+    if db_pool:
+        conn = None
+        try:
+            conn = db_pool.getconn()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, username, plan FROM users WHERE username=%s AND is_active=true",
+                    (username,)
+                )
+                row = cur.fetchone()
+                if row:
+                    return {"id": row[0], "username": row[1], "plan": row[2]}
+        except Exception:
+            pass
+        finally:
+            if conn:
+                release_db_conn(conn)
 
-    raise HTTPException(status_code=401,
-                        detail="Not authenticated",
+    # Fallback: env var user
+    env_user = os.getenv("APP_USERNAME", "hoang")
+    if username == env_user:
+        return {"id": 0, "username": username, "plan": "admin"}
+
+    raise HTTPException(401, "User not found",
                         headers={"WWW-Authenticate": "Bearer"})
-
-# Keep check_auth as alias for backwards compat with existing endpoints
-async def check_auth(
-    token: str = Depends(oauth2_scheme),
-    credentials: HTTPBasicCredentials = Depends(security),
-) -> str:
-    user = await get_current_user(token=token, credentials=credentials)
-    return user["username"]
 
 # ─── Markdown → HTML ──────────────────────────────────────────────────────────
 def inline_md(text: str) -> str:
@@ -963,7 +999,7 @@ async def me(user: dict = Depends(get_current_user)):
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
-async def index(user: str = Depends(check_auth)):
+async def index(user: dict = Depends(get_current_user)):
     return HTML_PAGE
 
 @app.post("/stream")
@@ -986,7 +1022,7 @@ async def stream_report(request_body: dict, user: dict = Depends(get_current_use
     )
 
 @app.get("/default-sections")
-async def get_default_sections(mode: str = "sector", user: str = Depends(check_auth)):
+async def get_default_sections(mode: str = "sector", user: dict = Depends(get_current_user)):
     data = DEFAULT_SECTOR_SECTIONS if mode == "sector" else DEFAULT_COMPANY_SECTIONS
     return JSONResponse(data)
 
@@ -1117,7 +1153,7 @@ async def get_report(fname: str, user: dict = Depends(get_current_user)):
 
 
 @app.post("/slides")
-async def generate_slides(request_body: dict, user: str = Depends(check_auth)):
+async def generate_slides(request_body: dict, user: dict = Depends(get_current_user)):
     html    = request_body.get("html", "")
     subject = request_body.get("subject", "Báo cáo")
     if not html:
@@ -1168,7 +1204,7 @@ KHÔNG thêm markdown, KHÔNG thêm giải thích ngoài HTML."""
 
 
 @app.post("/docx")
-async def export_docx(request_body: dict, user: str = Depends(check_auth)):
+async def export_docx(request_body: dict, user: dict = Depends(get_current_user)):
     """Convert report HTML to DOCX and return as download."""
     from fastapi.responses import Response
     html    = request_body.get("html", "")
@@ -1562,18 +1598,14 @@ function clearToken() {
 }
 
 function apiFetch(url, opts={}) {
+  const token = getToken();
   if(!opts.headers) opts.headers = {};
-  const t = getToken();
-  if(t) {
-    opts.headers['Authorization'] = 'Bearer ' + t;
-  } else {
-    // Fallback Basic auth for legacy
-    opts.headers['Authorization'] = 'Basic ' + btoa('hoang:taxsector2026');
-  }
+  if(token) opts.headers['Authorization'] = 'Bearer ' + token;
   return fetch(url, opts).then(resp => {
     if(resp.status === 401) {
       clearToken();
       showLoginPage();
+      throw new Error('Session expired. Please log in again.');
     }
     return resp;
   });
@@ -2448,7 +2480,7 @@ def get_relevant_legal_cats(subject: str, sections: list = None) -> list:
 async def get_legal_refs(
     subject: str = "",
     cats: str = "",
-    user: str = Depends(check_auth)
+    user: dict = Depends(get_current_user)
 ):
     """Return relevant legal references for a given subject."""
     if cats:
@@ -2464,7 +2496,7 @@ async def get_legal_refs(
     return JSONResponse({"subject": subject, "categories": selected_cats, "refs": result})
 
 @app.post("/legal-appendix")
-async def generate_legal_appendix(request_body: dict, user: str = Depends(check_auth)):
+async def generate_legal_appendix(request_body: dict, user: dict = Depends(get_current_user)):
     """Generate HTML appendix with legal references for a report subject."""
     subject = request_body.get("subject", "")
     cats = request_body.get("cats", "")
