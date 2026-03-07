@@ -1,176 +1,334 @@
 # CLAUDE_v4.md — Instructions for Claude Code
 ## Tax Sector Research App — sectortax.gpt4vn.com
-
-### Context
-- App: FastAPI + Python, deployed on Coolify VPS (72.62.197.183)
-- GitHub: github.com/phanvuhoang/taxsector (branch: main)
-- File to edit: `main.py` (single-file app, ~1750 lines)
-- Container name (Coolify): `b48cggoog8k0gw8s40gskkg0-164819471497`
-- Volume mount: `/opt/tax-research-reports` → `/app/reports` (local VPS only)
-- rclone is NOT available inside the container — only on the VPS host
-- python-docx 1.1.2 is installed in container
+## Version: 4.0 | Date: 2026-03-07 | Author: ThanhAI
 
 ---
 
-## Tasks
+## Context & Current State
 
-### Task 1 — Remove "AI Gợi ý cấu trúc" button
+- **App:** FastAPI single-file app (`main.py`, ~1750 lines), Python 3.11
+- **GitHub:** github.com/phanvuhoang/taxsector (branch: main)
+- **Live URL:** https://sectortax.gpt4vn.com
+- **Coolify container:** `b48cggoog8k0gw8s40gskkg0-164819471497`
+- **Current auth:** Simple HTTP Basic Auth (single user: hoang/taxsector2026)
+- **Reports storage:** Local `/app/reports/` — lost on full container rebuild
 
-Remove the button with id `btn-recommend` and its associated JS function `aiRecommend()`.
-Also remove the `suggestSubs()` function and any button calling it (the ✨ per-section AI suggest button).
-Remove the `/validate-subject` API endpoint as well — it's no longer needed.
-Keep all other buttons and functionality intact.
+### Infrastructure already set up (DO NOT recreate):
+- **PostgreSQL** is running at host `postgresql-pgwo0w8g0c0ccg840kw84gs8` port `5432`
+- Database `sectortax` exists with tables `users` and `reports` already created
+- DB user: `sectortax_user` / password: `SectorTax2026Secure`
+- The sectortax container is already connected to the postgres network
+- `psycopg2-binary` needs to be added to `requirements.txt`
+
+### Schema (already exists, do NOT recreate):
+```sql
+users (id, username, email, password_hash, plan, is_active, created_at, last_login)
+reports (id, user_id, filename, subject, mode, file_size, storage_path, created_at)
+```
 
 ---
 
-### Task 2 — Google Drive report storage (persist across container restarts)
+## Tasks — implement ALL in one pass
 
-**Problem:** Reports saved to `/app/reports` inside the container are lost when Coolify rebuilds/restarts the container. The VPS volume mount `/opt/tax-research-reports:/app/reports` helps for restarts, but not for full rebuilds.
+---
 
-**Solution:** Use Google Drive as the source of truth via the Google Drive API (service account or API key approach). Since `rclone` is not inside the container, use the `google-auth` + `googleapiclient` Python libraries instead.
+### Task 1 — Remove "AI Gợi ý cấu trúc" buttons
 
-**Implementation details:**
+Remove completely:
+- Button `id="btn-recommend"` with `onclick="aiRecommend()"` and the `aiRecommend()` JS function
+- The ✨ per-section button calling `suggestSubs()` and the `suggestSubs()` function
+- The `/validate-subject` POST endpoint (no longer needed)
 
-1. Add to `requirements.txt`:
+Keep everything else intact.
+
+---
+
+### Task 2 — Multi-user auth with PostgreSQL (JWT)
+
+Replace the current HTTP Basic Auth with proper JWT-based session auth.
+
+**2a. Backend changes:**
+
+Add to `requirements.txt`:
+```
+psycopg2-binary==2.9.9
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-multipart==0.0.9
+```
+
+Add DB connection pool at startup:
+```python
+import psycopg2
+from psycopg2.pool import ThreadedConnectionPool
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+from datetime import timedelta
+
+DB_HOST = os.getenv("DB_HOST", "postgresql-pgwo0w8g0c0ccg840kw84gs8")
+DB_PORT = int(os.getenv("DB_PORT", "5432"))
+DB_NAME = os.getenv("DB_NAME", "sectortax")
+DB_USER = os.getenv("DB_USER", "sectortax_user")
+DB_PASS = os.getenv("DB_PASS", "SectorTax2026Secure")
+JWT_SECRET = os.getenv("JWT_SECRET", "sectortax-jwt-secret-change-in-prod")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_HOURS = 24 * 7  # 7 days
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+db_pool = None
+
+@app.on_event("startup")
+async def startup():
+    global db_pool
+    try:
+        db_pool = ThreadedConnectionPool(1, 10,
+            host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
+            user=DB_USER, password=DB_PASS)
+    except Exception as e:
+        print(f"DB connection failed: {e}")
+```
+
+**2b. Auth endpoints:**
+
+```python
+@app.post("/auth/login")
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    # verify username/password against DB
+    # return JWT token + user info
+
+@app.post("/auth/register")  
+async def register(...):
+    # create new user in DB (plan='free')
+    # return JWT token
+
+@app.get("/auth/me")
+async def me(token: str = Depends(oauth2_scheme)):
+    # return current user info
+```
+
+**2c. Dependency injection:**
+
+Replace the existing `auth` dependency with JWT-based:
+```python
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
+    # decode JWT, fetch user from DB, return user dict
+    # raise HTTPException(401) if invalid
+```
+
+Use `get_current_user` everywhere the old `auth` dependency was used.
+
+**2d. Fallback:** If DB is unavailable, fall back to env var auth (APP_USERNAME/APP_PASSWORD) so the app doesn't break.
+
+**2e. Frontend login page:**
+
+Replace the browser's HTTP Basic Auth dialog with a proper login page.
+When a request returns 401 (not logged in), show a full-page login form:
+```html
+<!-- Clean login page, same green brand color (#028a39) -->
+<!-- Fields: username, password -->
+<!-- On success: store JWT in localStorage, redirect to app -->
+<!-- "Register" link below login form -->
+```
+
+Store JWT in `localStorage` as `sectortax_token`.
+Send it as `Authorization: Bearer <token>` header in all API calls (update `apiFetch()`).
+
+---
+
+### Task 3 — Reports: GDrive sync + per-user storage
+
+**3a. Per-user report storage**
+
+Modify `save_report_local()` to:
+1. Accept `user_id` parameter
+2. Save file to `/app/reports/{user_id}/filename.html` (per-user subfolder)
+3. Insert record into `reports` table:
+   ```sql
+   INSERT INTO reports (user_id, filename, subject, mode, file_size, storage_path)
+   VALUES (%s, %s, %s, %s, %s, %s)
    ```
-   google-auth==2.29.0
-   google-auth-httplib2==0.2.0
-   google-api-python-client==2.131.0
-   ```
 
-2. Add env var `GDRIVE_FOLDER_ID` — the Google Drive folder ID for report storage.
-   The folder is `gdrive:Thanh-AI/TaxResearch/` on the owner's Drive.
-   Folder ID will be provided via environment variable.
+**3b. GDrive sync (best-effort)**
 
-3. Use a **Service Account JSON** stored as env var `GDRIVE_SERVICE_ACCOUNT_JSON` (base64-encoded).
-   If the env var is not set, fall back to local-only storage (graceful degradation).
+After saving locally, sync to GDrive using `subprocess` to call `rclone` on the **VPS host** via SSH.
 
-4. Modify `save_report_local()`:
-   - Save to `/app/reports/` as before (local cache)
-   - After saving, upload to GDrive asynchronously (non-blocking, use `asyncio.create_task`)
-   - Upload function: `async def upload_to_gdrive(fname: str, content: bytes)`
+Since `rclone` is not inside the container but IS on the VPS host (configured with `gdrive` remote), use this approach:
 
-5. Modify `list_reports` endpoint (`GET /reports`):
-   - First check local `/app/reports/` 
-   - Also list files from GDrive folder
-   - Merge, deduplicate by filename, return combined list sorted newest first
-   - If GDrive file not in local cache, download it on-demand when opened
+```python
+import subprocess
 
-6. Modify `GET /report/{fname}`:
-   - If file exists locally, serve it
-   - If not, try to download from GDrive, cache locally, then serve
+async def sync_to_gdrive(local_path: str, user_id: int, filename: str):
+    """Sync report to GDrive via rclone on VPS host. Best-effort, never blocks."""
+    try:
+        gdrive_path = f"gdrive:Thanh-AI/TaxResearch/user_{user_id}/{filename}"
+        # rclone is on the host, mounted via /usr/local/bin/rclone or similar
+        # Use nsenter to run on host, or map rclone binary via volume
+        subprocess.Popen(
+            ["rclone", "copyto", local_path, gdrive_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+    except Exception:
+        pass  # GDrive sync failure must never break the app
+```
 
-7. Modify `DELETE /report/{fname}`:
-   - Delete from local + GDrive
+**Note for Claude Code:** Check if `rclone` is available inside the container via `shutil.which('rclone')`. If not available, skip GDrive sync silently. The Dockerfile can optionally install rclone — add this to Dockerfile if needed:
+```dockerfile
+RUN apt-get update && apt-get install -y curl && \
+    curl -fsSL https://rclone.org/install.sh | bash && \
+    rm -rf /var/lib/apt/lists/*
+```
+But DO NOT add this if it makes the build too heavy. Local storage is sufficient for now.
 
-**IMPORTANT:** All GDrive operations must fail gracefully — if GDrive is unavailable or not configured, the app continues working with local storage only. Never let a GDrive error break the app.
+**3c. Reports listing (GET /reports)**
+
+Modify to return only the current user's reports from DB:
+```sql
+SELECT r.filename, r.subject, r.file_size, r.created_at, r.storage_path
+FROM reports r
+WHERE r.user_id = %s
+ORDER BY r.created_at DESC
+LIMIT 100
+```
+
+**3d. Report access control**
+
+`GET /report/{fname}` — only serve if the report belongs to current user.
+`DELETE /report/{fname}` — only delete if report belongs to current user, delete from DB too.
 
 ---
 
-### Task 3 — "Báo cáo đã lưu" button improvements
+### Task 4 — "Báo cáo đã lưu" UI improvements
 
-**3a. Show button on initial screen (before report is generated)**
+**4a. Always visible on header**
 
-Currently the "📂 Báo cáo đã lưu" button only appears after a report is generated (inside `#report-wrap`). 
+The "📂 Báo cáo đã lưu" button is already in the header at line ~1045. Make sure it's visible and functional even before a report is generated (currently may be hidden). It should always be clickable from the moment the page loads.
 
-Move it to the **header bar** so it's always visible. The header already has it at line ~1045, but it may be hidden or not rendering on initial load — make sure it's always visible regardless of state.
+**4b. Reports modal improvements**
 
-**3b. Reports list UI improvements**
+Update `loadReportsList()`:
 
-In the `loadReportsList()` function, update the reports modal to:
-
-1. **Sort newest first** (already done, keep it)
-2. **Show 10 most recent by default**, with a "📂 Xem thêm (N báo cáo)" button if total > 10
-3. **Add a search box** at the top of the modal:
+1. **Show 10 most recent** by default, sorted newest first
+2. **"Xem thêm" button** if total > 10:
    ```html
-   <input type="text" id="reports-search" placeholder="🔍 Tìm báo cáo..." 
-     class="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm mb-3 focus:outline-none focus:ring-2 focus:ring-green-300"
+   <button onclick="loadReportsList(true)" class="...">
+     📂 Xem thêm (N báo cáo)
+   </button>
+   ```
+3. **Search box** at top of modal:
+   ```html
+   <input type="text" id="reports-search" 
+     placeholder="🔍 Tìm theo tên báo cáo..."
+     class="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm mb-3"
      oninput="filterReports(this.value)">
    ```
-4. Implement `filterReports(query)` — filters the displayed list in real-time by filename (case-insensitive, Vietnamese-aware)
-5. When searching, ignore the 10-item limit (show all matching results)
+4. `filterReports(query)` — real-time filter by subject/filename, case-insensitive, shows all matches (ignores 10-item limit)
 
 ---
 
-### Task 4 — Fix DOCX export (intermittent failures)
+### Task 5 — Fix DOCX export
 
-The `/docx` endpoint uses `BeautifulSoup` for HTML parsing. Failures occur when:
-- `bs4` import fails silently
-- HTML passed is empty or malformed
-- `Document()` from python-docx raises on edge cases
+The `/docx` endpoint fails intermittently. Fix:
 
-**Fixes:**
-
-1. Add explicit import guard at top of file:
-   ```python
-   try:
-       from bs4 import BeautifulSoup
-       BS4_OK = True
-   except ImportError:
-       BS4_OK = False
-   ```
-
-2. In `/docx` endpoint, add validation:
-   ```python
-   if not html or not html.strip():
-       raise HTTPException(400, "Không có nội dung báo cáo để xuất. Vui lòng tạo báo cáo trước.")
-   if not BS4_OK:
-       raise HTTPException(503, "BeautifulSoup không khả dụng. Liên hệ admin.")
-   ```
-
-3. Wrap the entire document generation in try/except:
-   ```python
-   try:
-       # ... existing docx generation code ...
-   except Exception as e:
-       raise HTTPException(500, f"Lỗi xuất DOCX: {str(e)}")
-   ```
-
-4. In the frontend `exportDocx()` JS function, improve error handling:
-   - Show the actual error message from the server (not just "Không xuất được")
-   - Disable the button while exporting, re-enable after
-   - Example:
-   ```javascript
-   } catch(e) {
-     alert(`Không xuất được DOCX: ${e.message}`);
-   }
-   ```
-
----
-
-## Deployment
-
-After making changes:
-1. Commit to `main` branch on GitHub
-2. SSH to VPS: `ssh -i ~/.ssh/id_ed25519_vps root@72.62.197.183`
-3. Copy file to running Coolify container:
-   ```bash
-   docker cp /path/to/main.py b48cggoog8k0gw8s40gskkg0-164819471497:/app/main.py
-   docker restart b48cggoog8k0gw8s40gskkg0-164819471497
-   ```
-4. Verify: `curl -s -u hoang:taxsector2026 https://sectortax.gpt4vn.com/ | grep 'Báo cáo đã lưu'`
-
-Note: Do NOT use `docker build` — just copy `main.py` directly into the running container. The container already has all dependencies installed.
-
----
-
-## Environment Variables (already set in Coolify)
-```
-PERPLEXITY_API_KEY=pplx-...
-CLAUDIBLE_API_KEY=sk-...
-CLAUDIBLE_BASE_URL=https://claudible.io/v1
-CLAUDIBLE_MODEL=claude-sonnet-4.6
-APP_USERNAME=hoang
-APP_PASSWORD=taxsector2026
-REPORTS_DIR=/app/reports
+1. Add at top of file:
+```python
+try:
+    from bs4 import BeautifulSoup
+    BS4_OK = True
+except ImportError:
+    BS4_OK = False
 ```
 
-Variables to ADD in Coolify for GDrive (Task 2):
+2. In `/docx` endpoint, validate inputs first:
+```python
+if not html or not html.strip():
+    raise HTTPException(400, "Không có nội dung báo cáo để xuất.")
+if not BS4_OK:
+    raise HTTPException(503, "BeautifulSoup không khả dụng.")
 ```
-GDRIVE_FOLDER_ID=<folder_id_of_Thanh-AI/TaxResearch>
-GDRIVE_SERVICE_ACCOUNT_JSON=<base64_encoded_service_account_json>
+
+3. Wrap document generation in try/except:
+```python
+try:
+    # ... existing code ...
+except Exception as e:
+    raise HTTPException(500, f"Lỗi tạo DOCX: {str(e)}")
+```
+
+4. Frontend `exportDocx()` — show actual server error message:
+```javascript
+const errText = await resp.text();
+alert(`Không xuất được DOCX: ${errText}`);
 ```
 
 ---
 
-*Written by ThanhAI — 2026-03-07*
+## Deployment instructions
+
+After making all changes:
+
+### Step 1: Commit to GitHub
+```bash
+git add -A
+git commit -m "feat: multi-user auth, PostgreSQL reports, UI improvements, docx fix"
+git push origin main
+```
+
+### Step 2: Deploy to Coolify container
+```bash
+# SSH to VPS
+ssh -i ~/.ssh/id_ed25519_vps root@72.62.197.183
+
+# Copy main.py to running container
+docker cp main.py b48cggoog8k0gw8s40gskkg0-164819471497:/app/main.py
+
+# Install new dependencies inside container
+docker exec b48cggoog8k0gw8s40gskkg0-164819471497 pip install \
+  psycopg2-binary==2.9.9 \
+  "python-jose[cryptography]==3.3.0" \
+  "passlib[bcrypt]==1.7.4" \
+  python-multipart==0.0.9 -q
+
+# Restart
+docker restart b48cggoog8k0gw8s40gskkg0-164819471497
+
+# Verify
+curl -s https://sectortax.gpt4vn.com/ | grep -c 'login\|Đăng nhập'
+```
+
+### Step 3: Add env vars in Coolify dashboard (cl.gpt4vn.com)
+Add these to the sectortax application environment:
+```
+DB_HOST=postgresql-pgwo0w8g0c0ccg840kw84gs8
+DB_PORT=5432
+DB_NAME=sectortax
+DB_USER=sectortax_user
+DB_PASS=SectorTax2026Secure
+JWT_SECRET=sectortax-jwt-2026-change-this
+```
+
+### Step 4: Create default admin user
+After deployment, the `hoang` user needs to be seeded into PostgreSQL:
+```bash
+docker exec postgresql-pgwo0w8g0c0ccg840kw84gs8 psql -U XknVFqfKI30PJava -d sectortax -c "
+  INSERT INTO users (username, email, password_hash, plan)
+  VALUES ('hoang', 'vuhoang04@gmail.com', 
+    crypt('taxsector2026', gen_salt('bf')), 'admin')
+  ON CONFLICT (username) DO NOTHING;
+"
+```
+Or implement a `/auth/seed-admin` endpoint (protected, one-time use).
+
+---
+
+## Important constraints
+
+1. **Single file** — keep everything in `main.py`, do not split into multiple files
+2. **Graceful degradation** — if DB is down, app must still work (fall back to env var auth + local reports)
+3. **No breaking changes** — existing reports in `/app/reports/` should still be accessible
+4. **Keep existing features** — all current functionality (Perplexity research, Claude AI, Dashboard, Slides, DOCX, Appendix) must continue working
+5. **Do NOT change** the Coolify docker-compose or Dockerfile unless strictly necessary
+
+---
+
+*Written by ThanhAI — tax.gpt4vn.com | 2026-03-07*
