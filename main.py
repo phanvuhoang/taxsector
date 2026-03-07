@@ -436,6 +436,17 @@ tr:nth-child(even) td{{background:#e6f4ec}}
 Báo cáo tổng hợp tự động bởi AI. Mang tính tham khảo.</div>
 </body></html>"""
     (REPORTS_DIR / fname).write_text(full, encoding="utf-8")
+    # Sync to GDrive (non-blocking background)
+    try:
+        import subprocess as _sp
+        _sp.Popen(
+            ["rclone", "copyto",
+             str(REPORTS_DIR / fname),
+             f"gdrive:Thanh-AI/TaxResearch/{fname}"],
+            stdout=_sp.DEVNULL, stderr=_sp.DEVNULL
+        )
+    except Exception:
+        pass  # GDrive sync failure must not break report saving
     return fname
 
 # ─── SSE stream ───────────────────────────────────────────────────────────────
@@ -707,8 +718,17 @@ async def get_default_sections(mode: str = "sector", user: str = Depends(check_a
 
 @app.get("/reports")
 async def list_reports(user: str = Depends(check_auth)):
+    import subprocess as _sp, time as _time
+    # Pull any GDrive reports not in local (sync GDrive → local)
+    try:
+        _sp.run(
+            ["rclone", "copy", "gdrive:Thanh-AI/TaxResearch/", str(REPORTS_DIR)],
+            timeout=15, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL
+        )
+    except Exception:
+        pass
     files = sorted(REPORTS_DIR.glob("*.html"), key=lambda f: f.stat().st_mtime, reverse=True)
-    return JSONResponse([{"name":f.name,"size":f.stat().st_size,"mtime":f.stat().st_mtime,"url":f"/report/{f.name}"} for f in files[:50]])
+    return JSONResponse([{"name":f.name,"size":f.stat().st_size,"mtime":f.stat().st_mtime,"url":f"/report/{f.name}"} for f in files[:100]])
 
 @app.delete("/report/{fname}")
 async def delete_report(fname: str, user: str = Depends(check_auth)):
@@ -716,6 +736,15 @@ async def delete_report(fname: str, user: str = Depends(check_auth)):
     if not path.exists() or not path.name.endswith(".html"):
         raise HTTPException(404)
     path.unlink()
+    # Also delete from GDrive
+    try:
+        import subprocess as _sp
+        _sp.Popen(
+            ["rclone", "deletefile", f"gdrive:Thanh-AI/TaxResearch/{fname}"],
+            stdout=_sp.DEVNULL, stderr=_sp.DEVNULL
+        )
+    except Exception:
+        pass
     return JSONResponse({"ok": True})
 
 @app.get("/report/{fname}", response_class=HTMLResponse)
