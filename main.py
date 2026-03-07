@@ -1,1752 +1,1972 @@
-#!/usr/bin/env python3
-"""Tax Sector Research Tool — Single-file FastAPI application"""
-
-import os, asyncio, json, re, io, secrets, time
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+# Claude via httpx directly (no SDK timeout issues)
+from io import BytesIO
+try:
+    from docx import Document as DocxDocument
+    from docx.shared import Pt, RGBColor, Inches
+    DOCX_OK = True
+except ImportError:
+    DOCX_OK = False
+import httpx
+import asyncio
+import json
+import os
+import re
+import secrets
+import subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import AsyncGenerator
 
-import anthropic
-import httpx
-from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, FileResponse, Response
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from docx import Document
-from docx.shared import RGBColor
-from bs4 import BeautifulSoup
-
-# ── Config ────────────────────────────────────────────────────────────────────
-PERPLEXITY_KEY = os.getenv("PERPLEXITY_API_KEY", "")
-ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
-CLAUDE_MODEL   = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5")
-APP_USER       = os.getenv("APP_USERNAME", "hoang")
-APP_PASS       = os.getenv("APP_PASSWORD", "taxsector2026")
-REPORTS_DIR    = Path(os.getenv("REPORTS_DIR", "./reports"))
-REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-
-# ── Auth ──────────────────────────────────────────────────────────────────────
+app = FastAPI(title="Tax Sector Research Tool")
 security = HTTPBasic()
 
-def auth(creds: HTTPBasicCredentials = Depends(security)):
-    ok = (
-        secrets.compare_digest(creds.username.encode(), APP_USER.encode()) and
-        secrets.compare_digest(creds.password.encode(), APP_PASS.encode())
-    )
-    if not ok:
-        raise HTTPException(401, headers={"WWW-Authenticate": "Basic"})
-    return creds.username
+PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY", "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")
+CLAUDIBLE_API_KEY  = os.getenv("CLAUDIBLE_API_KEY", "")
+CLAUDIBLE_BASE_URL = os.getenv("CLAUDIBLE_BASE_URL", "https://claudible.io/v1")
+CLAUDIBLE_MODEL    = os.getenv("CLAUDIBLE_MODEL", "claude-sonnet-4.6")
+CLAUDIBLE_ENDPOINT = CLAUDIBLE_BASE_URL.rstrip("/") + "/chat/completions"
+APP_PASSWORD       = os.getenv("APP_PASSWORD", "taxsector2026")
+APP_USERNAME       = os.getenv("APP_USERNAME", "hoang")
+GDRIVE_FOLDER      = "Thanh-AI/TaxResearch"
+REPORTS_DIR        = Path("/app/reports")
+REPORTS_DIR.mkdir(exist_ok=True)
 
-# ── Default sections ──────────────────────────────────────────────────────────
-SECTOR_SECTIONS = [
-    {"id": "s1", "title": "Tong quan ve nganh",
-     "sub": ["Quy mo thi truong", "Dac diem kinh doanh", "Mo hinh doanh thu/chi phi"], "enabled": True},
-    {"id": "s2", "title": "Dac thu cua nganh",
-     "sub": ["Chuoi cung ung upstream/downstream", "Working capital cycle", "Dac diem tai san"], "enabled": True},
-    {"id": "s3", "title": "Su phat trien tai Viet Nam & Big Players",
-     "sub": ["Tang truong 5 nam gan nhat", "Doanh nghiep lon nhat", "FDI", "M&A"], "enabled": True},
-    {"id": "s4", "title": "Cac quy dinh phap ly quan trong",
-     "sub": ["Luat chuyen nganh", "Dieu kien kinh doanh", "Giay phep", "Han che FDI"], "enabled": True},
-    {"id": "s5", "title": "Phan tich cac loai thue ap dung",
-     "sub": ["Thue TNDN", "Thue GTGT", "Thue Nha thau", "Thue TTDB", "Thue XNK", "Phi & le phi"], "enabled": True},
-    {"id": "s6", "title": "Cac van de thue dac thu cua nganh",
-     "sub": ["Rui ro doanh thu/chi phi", "Chuyen gia", "Uu dai thue",
-             "Hoa don dac thu", "Khau tru thue",
-             "Tranh chap thue & an le",
-             "Cong van/huong dan dac thu Tong cuc Thue cho nganh"], "enabled": True},
-    {"id": "s7", "title": "Thong le & van de thue quoc te",
-     "sub": ["BEPS", "Chuyen gia quoc te", "So sanh voi khu vuc", "Hiep dinh thue"], "enabled": True},
-]
+PERPLEXITY_URL = "https://api.perplexity.ai/chat/completions"
 
-SECTOR_SECTIONS_VI = [
-    {"id": "s1", "title": "Tổng quan về ngành",
-     "sub": ["Quy mô thị trường", "Đặc điểm kinh doanh", "Mô hình doanh thu/chi phí"], "enabled": True},
-    {"id": "s2", "title": "Đặc thù của ngành",
-     "sub": ["Chuỗi cung ứng upstream/downstream", "Working capital cycle", "Đặc điểm tài sản"], "enabled": True},
-    {"id": "s3", "title": "Sự phát triển tại Việt Nam & Big Players",
-     "sub": ["Tăng trưởng 5 năm gần nhất", "Doanh nghiệp lớn nhất", "FDI", "M&A"], "enabled": True},
-    {"id": "s4", "title": "Các quy định pháp lý quan trọng",
-     "sub": ["Luật chuyên ngành", "Điều kiện kinh doanh", "Giấy phép", "Hạn chế FDI"], "enabled": True},
-    {"id": "s5", "title": "Phân tích các loại thuế áp dụng",
-     "sub": ["Thuế TNDN", "Thuế GTGT", "Thuế Nhà thầu", "Thuế TTĐB", "Thuế XNK", "Phí & lệ phí"], "enabled": True},
-    {"id": "s6", "title": "Các vấn đề thuế đặc thù của ngành",
-     "sub": [
-         "Rủi ro doanh thu/chi phí",
-         "Chuyển giá",
-         "Ưu đãi thuế",
-         "Hóa đơn đặc thù",
-         "Khấu trừ thuế",
-         "Tranh chấp thuế & án lệ",
-         "Công văn/hướng dẫn đặc thù của Tổng cục Thuế cho ngành",
-     ], "enabled": True},
-    {"id": "s7", "title": "Thông lệ & vấn đề thuế quốc tế",
-     "sub": ["BEPS", "Chuyển giá quốc tế", "So sánh với khu vực", "Hiệp định thuế"], "enabled": True},
-]
-
-COMPANY_SECTIONS_VI = [
-    {"id": "c1", "title": "Giới thiệu công ty",
-     "sub": ["Lịch sử hình thành", "Cơ cấu sở hữu", "Hoạt động kinh doanh chính"], "enabled": True},
-    {"id": "c2", "title": "Mô hình kinh doanh & chuỗi giá trị",
-     "sub": ["Sản phẩm/dịch vụ", "Khách hàng mục tiêu", "Nhà cung cấp", "Chuỗi giá trị"], "enabled": True},
-    {"id": "c3", "title": "Phân tích tài chính & thuế",
-     "sub": ["Doanh thu & lợi nhuận", "Gánh nặng thuế", "Tỷ lệ thuế hiệu quả", "So sánh ngành"], "enabled": True},
-    {"id": "c4", "title": "Rủi ro thuế đặc thù",
-     "sub": [
-         "Rủi ro thanh tra",
-         "Chuyển giá",
-         "Cấu trúc pháp lý",
-         "Giao dịch liên kết",
-         "Tranh chấp thuế & lịch sử thanh/kiểm tra",
-         "Công văn/ruling đặc thù áp dụng cho công ty/ngành",
-     ], "enabled": True},
-    {"id": "c5", "title": "Khuyến nghị",
-     "sub": ["Tối ưu hóa thuế", "Tuân thủ", "Cơ hội ưu đãi", "Rủi ro cần theo dõi"], "enabled": True},
-]
-
-# ── Research: Perplexity ──────────────────────────────────────────────────────
-def build_query(section: dict, subject: str, mode: str) -> str:
-    from datetime import datetime
-    current_year = datetime.now().year
-    mode_ctx = "ngành" if mode == "sector" else "công ty"
-
-    # For company mode, add industry hint to help Perplexity find relevant laws
-    subject_ctx = subject
-    if mode == "company":
-        subject_ctx = f"{subject} (phân tích thuế doanh nghiệp)"
-
-    subs = ", ".join(section.get("sub", []))
-    title_lower = section.get("title", "").lower()
-    is_legal = any(k in title_lower for k in [
-        "pháp lý","luật","quy định","thuế","thue","tài chính","rủi ro","tranh chấp"
-    ])
-    legal_note = (
-        f"\nLƯU Ý BẮT BUỘC: Chỉ trích dẫn văn bản pháp luật CÒN HIỆU LỰC tính đến {current_year}. "
-        f"Ưu tiên Luật/Nghị định/Thông tư được ban hành hoặc sửa đổi trong 2020-{current_year}. "
-        f"Nếu có văn bản mới thay thế → bắt buộc dùng văn bản MỚI NHẤT, ghi rõ nó thay thế văn bản nào. "
-        f"KHÔNG trích dẫn văn bản đã bị bãi bỏ."
-    ) if is_legal else ""
-
-    return (
-        f"Nghiên cứu chuyên sâu về: {section['title']} — {mode_ctx} {subject_ctx} tại Việt Nam năm {current_year}\n"
-        f"Chi tiết cần tìm: {subs}\n"
-        f"Bao gồm: số hiệu văn bản pháp luật cụ thể, số liệu thị trường, "
-        f"tên doanh nghiệp, ví dụ thực tế, nguồn đáng tin cậy"
-        f"{legal_note}"
-    )
-
-async def perplexity_search(query: str, model: str = "sonar") -> dict:
-    if not PERPLEXITY_KEY:
-        return {"content": f"[Perplexity API key not set]\n\nQuery was: {query[:200]}", "citations": []}
-
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content":
-             "Bạn là chuyên gia nghiên cứu thuế và pháp lý Việt Nam. "
-             "Cung cấp thông tin chính xác, đầy đủ, có số liệu cụ thể và nguồn tham khảo."},
-            {"role": "user", "content": query},
-        ],
-        "max_tokens": 2000,
-        "return_citations": True,
-        "return_related_questions": False,
-    }
-
-    async with httpx.AsyncClient(timeout=httpx.Timeout(90.0)) as client:
-        try:
-            r = await client.post(
-                "https://api.perplexity.ai/chat/completions",
-                headers={"Authorization": f"Bearer {PERPLEXITY_KEY}"},
-                json=payload,
-            )
-            r.raise_for_status()
-            data = r.json()
-            content = data["choices"][0]["message"]["content"]
-            citations = data.get("citations", [])
-            return {"content": content, "citations": citations}
-        except Exception as e:
-            return {"content": f"[Research error: {e}]", "citations": []}
-
-# ── Research: thuvienphapluat.vn ─────────────────────────────────────────────
-TVPL_BASE = "https://thuvienphapluat.vn"
-
-def is_legal_or_tax_section(section: dict) -> bool:
-    """Return True if this section needs legal docs from thuvienphapluat.vn."""
-    title = section.get("title", "").lower()
-    subs  = " ".join(section.get("sub", [])).lower()
-    keywords = [
-        "pháp lý", "luật", "quy định", "giấy phép",
-        "thuế", "thue", "tndn", "gtgt", "ttđb", "xnk",
-        "nhà thầu", "chuyển giá", "ưu đãi", "tuân thủ",
-        "phap ly", "van ban", "legal",
-        # Company-specific additions:
-        "tài chính", "gánh nặng", "tỷ lệ thuế", "rủi ro thuế",
-        "thanh tra", "kiểm tra", "giao dịch liên kết", "cấu trúc pháp",
-        "rui ro", "tranh chap", "ruling", "cong van",
-    ]
-    return any(kw in title + " " + subs for kw in keywords)
-
-def build_tvpl_query(section: dict, subject: str, mode: str = "sector") -> str:
-    title = section.get("title", "").lower()
-    subs  = " ".join(section.get("sub", [])).lower()
-
-    # For company mode: add "doanh nghiệp" context
-    base_subject = subject
-    if mode == "company":
-        base_subject = f"{subject} doanh nghiệp"
-
-    kw_map = {
-        "thuế gtgt": "thuế giá trị gia tăng",
-        "thuế tndn": "thuế thu nhập doanh nghiệp",
-        "thuế ttđb": "thuế tiêu thụ đặc biệt",
-        "thuế xnk": "thuế xuất nhập khẩu",
-        "nhà thầu": "thuế nhà thầu",
-        "chuyển giá": "chuyển giá giao dịch liên kết",
-        "ưu đãi": f"ưu đãi thuế {base_subject}",
-        "tranh chấp": f"tranh chấp thuế {base_subject}",
-        "giao dịch liên kết": "chuyển giá giao dịch liên kết",
-        "tài chính": f"thuế {base_subject}",
-        "thuế": f"thuế {base_subject}",
-        "pháp lý": base_subject,
-        "luật": base_subject,
-        "quy định": base_subject,
-    }
-    for kw, q in kw_map.items():
-        if kw in title or kw in subs:
-            return q
-    return f"thuế {base_subject}"
-
-async def tvpl_search(query: str, max_results: int = 10) -> list:
-    """Scrape thuvienphapluat.vn for currently-in-effect legal documents."""
-    params = {
-        "q": query,
-        "sbt": "1",   # sort by date descending (newest first)
-        "efts": "1",  # còn hiệu lực only — filters out superseded docs
-        "page": "1",
-    }
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8",
-        "Referer": TVPL_BASE,
-    }
-
-    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0), follow_redirects=True) as client:
-        try:
-            r = await client.get(
-                f"{TVPL_BASE}/van-ban-phap-luat.aspx",
-                params=params,
-                headers=headers,
-            )
-            r.raise_for_status()
-        except Exception as e:
-            return [{"error": str(e)}]
-
-    soup = BeautifulSoup(r.text, "lxml")
-    results = []
-
-    items = (
-        soup.select("div.doc-item") or
-        soup.select("ul.result-list > li") or
-        soup.select(".document-list .item") or
-        soup.select("table.list-vb tr") or
-        soup.select("a[href*='/van-ban/']")
-    )
-
-    doc_types = [
-        "Luật", "Nghị định", "Thông tư", "Quyết định",
-        "Nghị quyết", "Chỉ thị", "Công văn", "Pháp lệnh",
-        "Hiệp định", "Thông tư liên tịch",
-    ]
-    issuers = [
-        "Quốc hội", "Chính phủ", "Bộ Tài chính", "Bộ Kế hoạch và Đầu tư",
-        "Tổng cục Thuế", "Bộ Công Thương", "Ngân hàng Nhà nước",
-        "Bộ Lao động", "UBND", "Bộ Xây dựng",
-    ]
-
-    for item in items[:max_results]:
-        doc = {}
-        link = item.select_one("a[href*='/van-ban/']") or (item if item.name == "a" else None)
-        if not link:
-            continue
-        doc["title"] = link.get_text(strip=True)
-        href = link.get("href", "")
-        doc["url"] = href if href.startswith("http") else f"{TVPL_BASE}{href}"
-        if not doc["title"] or not doc["url"]:
-            continue
-        meta = item.get_text(" ", strip=True)
-        doc["doc_type"] = next((t for t in doc_types if t in doc["title"]), "Văn bản")
-        date_m = re.search(r'\b(\d{2}/\d{2}/\d{4})\b', meta)
-        doc["issued_date"] = date_m.group(1) if date_m else ""
-        doc["issuer"] = next((i for i in issuers if i in meta), "")
-        doc["status"] = "Còn hiệu lực"
-        results.append(doc)
-
-    return results
-
-def format_tvpl_results(docs: list) -> str:
-    """Format TVPL docs as context text for Claude."""
-    valid = [d for d in docs if "error" not in d and d.get("title")]
-    if not valid:
-        return ""
-    lines = ["=== VĂN BẢN PHÁP LUẬT HIỆN HÀNH (nguồn: thuvienphapluat.vn) ===\n"]
-    for i, d in enumerate(valid, 1):
-        lines.append(
-            f"{i}. [{d['doc_type']}] {d['title']}\n"
-            f"   URL: {d['url']}\n"
-            f"   Ban hành: {d.get('issued_date','')} | "
-            f"Cơ quan: {d.get('issuer','')} | Trạng thái: Còn hiệu lực\n"
-        )
-    return "\n".join(lines)
-
-async def _empty():
-    return []
-
-# ── Context filtering ─────────────────────────────────────────────────────────
-KEYWORD_MAP = {
-    "pháp lý": ["s4", "c4"],
-    "luật": ["s4", "c4"],
-    "quy định": ["s4", "c4"],
-    "thuế": ["s5", "s6", "s7", "c3", "c4"],
-    "tổng quan": ["s1", "c1"],
-    "đặc thù": ["s2", "s6"],
-    "big player": ["s3"],
-    "doanh nghiep": ["s3", "c1"],
-    "quoc te": ["s7"],
-    "tài chính": ["c3"],
-    "khuyến nghị": ["c5"],
-    "mô hình": ["s1", "s2", "c2"],
-    "chuỗi": ["s2", "c2"],
-}
-
-def filter_context(all_results: dict, section: dict) -> str:
-    title_lower = section["title"].lower()
-    relevant = {section["id"]}
-    for kw, ids in KEYWORD_MAP.items():
-        if kw in title_lower:
-            relevant.update(ids)
-
-    parts = []
-    # Own section first
-    if section["id"] in all_results:
-        parts.append(all_results[section["id"]].get("content", "")[:5000])
-    # Related sections (shorter)
-    for sid in relevant:
-        if sid != section["id"] and sid in all_results:
-            parts.append(all_results[sid].get("content", "")[:2000])
-
-    return "\n\n---\n\n".join(parts)[:10000]
-
-# ── Claude per-section streaming ──────────────────────────────────────────────
-def build_section_prompt(section: dict, subject: str, context: str, mode: str, num: int) -> str:
-    mode_ctx = "ngành" if mode == "sector" else "công ty"
-    sub_list = "\n".join(f"- {s}" for s in section.get("sub", []))
-    title = section["title"]
-
-    is_legal = any(k in title.lower() for k in ["pháp lý", "luật", "quy định", "phap ly", "luat"])
-    is_tax   = any(k in title.lower() for k in ["thuế", "thue"])
-
-    table_block = ""
-    if is_legal or is_tax:
-        table_block = """
-QUAN TRỌNG — VĂN BẢN PHÁP LUẬT:
-1. CHỈ sử dụng văn bản đang CÒN HIỆU LỰC tại thời điểm hiện tại (2025-2026).
-2. Nếu có văn bản mới thay thế/sửa đổi văn bản cũ → chỉ trích dẫn văn bản MỚI NHẤT.
-3. KHÔNG trích dẫn văn bản đã bị bãi bỏ, thay thế hoặc hết hiệu lực.
-4. Ưu tiên văn bản từ phần "VĂN BẢN PHÁP LUẬT HIỆN HÀNH" trong dữ liệu nghiên cứu.
-5. Bắt đầu section bằng bảng tổng hợp văn bản (ít nhất 6-8 văn bản còn hiệu lực):
-<table>
-  <thead><tr>
-    <th>Số hiệu</th><th>Tên văn bản</th><th>Loại</th>
-    <th>Ngày ban hành</th><th>Hiệu lực</th><th>Ghi chú sửa đổi</th>
-  </tr></thead>
-  <tbody>... điền thực tế, ghi rõ nếu văn bản này thay thế văn bản nào ...</tbody>
-</table>
-"""
-
-    return f"""Bạn là chuyên gia thuế Big 4 (Deloitte/PwC/EY/KPMG) viết báo cáo phân tích thuế chuyên nghiệp bằng tiếng Việt.
-
-Viết PHẦN {num}: "{title}" trong báo cáo phân tích về {mode_ctx}: **{subject}**
-
-Các chủ đề bắt buộc đề cập:
-{sub_list}
-{table_block}
-DỮ LIỆU NGHIÊN CỨU (dùng thông tin này, bổ sung thêm kiến thức của bạn):
-{context}
-
-YÊU CẦU TUYỆT ĐỐI:
-1. Output là HTML THUẦN TÚY — KHÔNG markdown, KHÔNG backticks, KHÔNG code block
-2. Bắt đầu bằng: <h2>{num}. {title}</h2>
-3. Dùng thẻ HTML: <h3>, <p>, <ul><li>, <ol><li>, <table> — KHÔNG <div> thừa
-4. Văn phong: chuyên nghiệp, cụ thể, dẫn chứng số liệu và tên văn bản pháp luật thực tế
-5. TRÍCH DẪN NGUỒN — BẮT BUỘC TUYỆT ĐỐI:
-   - Sau MỖI câu có số liệu, tên văn bản, hoặc thông tin cụ thể → chèn ngay: <a href="URL" target="_blank" rel="noopener">[N]</a>
-   - N là số thứ tự tăng dần từ 1 trong toàn bộ phần này
-   - URL phải là URL thực tế từ dữ liệu nghiên cứu (Perplexity citations hoặc thuvienphapluat.vn)
-   - Nếu không có URL cụ thể cho câu đó → dùng URL tổng quát của nguồn
-   - KHÔNG viết [N] mà không có thẻ <a href=...>
-   - KHÔNG gộp nhiều câu dùng chung 1 citation số
-   Ví dụ đúng: Thuế GTGT hiện hành là 10%.<a href="https://thuvienphapluat.vn/van-ban/..." target="_blank" rel="noopener">[1]</a>
-   Ví dụ sai: Thuế GTGT hiện hành là 10%.[1] hoặc [1] không có href
-6. Tối thiểu 700 từ — đầy đủ, không rút gọn
-7. KHÔNG viết lời mở đầu/kết luận tổng quát — chỉ nội dung của phần này"""
-
-async def claude_stream_section(
-    section: dict, subject: str, context: str, mode: str, num: int
-) -> AsyncGenerator[str, None]:
-    if not ANTHROPIC_KEY:
-        yield f"<h2>{num}. {section['title']}</h2><p><em>[Anthropic API key not configured]</em></p>"
-        return
-
-    prompt = build_section_prompt(section, subject, context, mode, num)
-    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
-
-    try:
-        async with client.messages.stream(
-            model=CLAUDE_MODEL,
-            max_tokens=8192,
-            messages=[{"role": "user", "content": prompt}],
-        ) as stream:
-            async for text in stream.text_stream:
-                yield text
-    except Exception as e:
-        yield f'<p style="color:red">[Error in section {num}: {e}]</p>'
-
-# ── Report persistence ────────────────────────────────────────────────────────
-CAVEAT_HTML = """
-<div style="margin-top:3rem;padding:1rem 1.5rem;background:#f8fafc;border-top:2px solid #e2e8f0;
-            border-radius:.5rem;font-size:.8rem;color:#64748b;line-height:1.6">
-  <strong>&#9888;&#65039; Lưu ý quan trọng:</strong> Báo cáo này được tạo tự động bởi
-  <strong>Tax Sector Research AI</strong> dựa trên dữ liệu từ Perplexity (sonar model)
-  và thuvienphapluat.vn. Nội dung mang tính tham khảo, không thay thế tư vấn pháp lý
-  hoặc thuế chuyên nghiệp. Người dùng cần kiểm chứng độc lập trước khi áp dụng.
-  Thông tin pháp luật có thể thay đổi — vui lòng xác nhận hiệu lực văn bản tại
-  <a href="https://thuvienphapluat.vn" target="_blank" rel="noopener">thuvienphapluat.vn</a>.
-  <br><em>Ngày tạo: {date_str}</em>
-</div>
-"""
-
-def safe_filename(s: str) -> str:
-    return re.sub(r'[\\/*?:"<>|]', "", s)[:60].strip()
-
-def save_report(subject: str, html_content: str) -> str:
+def build_report_system_prompt() -> str:
     now = datetime.now()
-    date_str = now.strftime("%d%m%Y")
-    time_str = now.strftime("%H%M")
-    base = safe_filename(subject)
-    name = f"{date_str} - {base} - {time_str}.html"
+    year = now.year
+    prev_year = year - 1
+    two_years_ago = year - 2
+    return f"""Bạn là chuyên gia tư vấn thuế cao cấp tại Việt Nam với 30 năm kinh nghiệm Big 4.
+Viết báo cáo phân tích thuế chuyên sâu dựa trên dữ liệu nghiên cứu được cung cấp.
 
-    # Handle rare collision (same subject, same minute)
-    if (REPORTS_DIR / name).exists():
-        name = f"{date_str} - {base} - {now.strftime('%H%M%S')}.html"
+Thời điểm báo cáo: {now.strftime("%m/%Y")}
 
-    full_html = f"""<!DOCTYPE html>
-<html lang="vi">
-<head>
-<meta charset="UTF-8">
-<title>Phan Tich Thue — {subject}</title>
-<style>
-body{{font-family:system-ui,sans-serif;max-width:900px;margin:2rem auto;padding:0 1.5rem;line-height:1.75;color:#1e293b}}
-h1{{color:#028a39;border-bottom:3px solid #028a39;padding-bottom:.5rem}}
-h2{{color:#028a39;border-bottom:2px solid #028a39;padding-bottom:4px;margin-top:2.5rem}}
-h3{{margin-top:1.5rem;color:#1e293b}}
-table{{width:100%;border-collapse:collapse;margin:1rem 0;font-size:.875rem}}
-th{{background:#028a39;color:#fff;padding:8px;text-align:left}}
-td{{padding:6px 8px;border:1px solid #e2e8f0}}
-tr:nth-child(even) td{{background:#f8fafc}}
-a{{color:#028a39}}
-ul,ol{{padding-left:1.5rem}}
-li{{margin:.25rem 0}}
-p{{margin:.6rem 0}}
-@media print{{body{{max-width:100%}}}}
-</style>
-</head>
-<body>
-<h1>Phan Tich Thue — {subject}</h1>
-<p><em>Ngay tao: {now.strftime("%d/%m/%Y %H:%M")}</em></p>
-<div id="report-body">
-{html_content}
-</div>
-{CAVEAT_HTML.format(date_str=now.strftime("%d/%m/%Y %H:%M"))}
-</body>
-</html>"""
-    (REPORTS_DIR / name).write_text(full_html, encoding="utf-8")
-    return name
+Yêu cầu:
+- Tiếng Việt, chuyên nghiệp, Big 4 style
+- Độ dài 10-15 trang A4
+- Tập trung vào văn bản pháp luật ĐANG HIỆU LỰC tại thời điểm {now.strftime("%m/%Y")}
+- Ưu tiên văn bản ban hành trong {two_years_ago}-{year}. Nếu văn bản cũ hơn vẫn còn hiệu lực và không bị thay thế, vẫn đề cập nhưng ghi rõ năm ban hành
+- KHÔNG tự suy đoán hoặc bịa đặt số hiệu văn bản. Chỉ nêu văn bản có trong dữ liệu nghiên cứu
+- Dẫn nguồn: số Thông tư, Nghị định, Công văn cụ thể kèm năm ban hành
 
-def linkify_citations(html: str, citations: list) -> str:
-    """Safety net: replace bare [N] with linked version using citation URLs."""
-    def replacer(m):
-        idx = int(m.group(1)) - 1
-        if 0 <= idx < len(citations) and citations[idx]:
-            url = citations[idx]
-            return f'<a href="{url}" target="_blank" rel="noopener">[{idx+1}]</a>'
-        return m.group(0)
-    # Only replace [N] that are NOT already inside an <a> tag
-    return re.sub(r'(?<!href=")\[(\d+)\](?![^<]*</a>)', replacer, html)
+OUTPUT FORMAT — BẮT BUỘC:
+- CHỈ dùng HTML: h2 h3 p ul ol li strong em table thead tbody tr th td
+- TUYỆT ĐỐI KHÔNG dùng markdown (**, ##, *, ---, ```, |---|)
+- Bullet points nhiều cấp: dùng <ul><li> lồng nhau (<ul> trong <li>) để thể hiện indent
+- Bảng: dùng <table><thead><tr><th>...</th></tr></thead><tbody>...</tbody></table>
+- KHÔNG có text ngoài các phần được yêu cầu
+- Bắt đầu NGAY bằng thẻ h2 đầu tiên"""
 
-# ── FastAPI app ───────────────────────────────────────────────────────────────
-app = FastAPI(title="Tax Sector Research")
+# ─── Auth ─────────────────────────────────────────────────────────────────────
+def check_auth(credentials: HTTPBasicCredentials = Depends(security)):
+    ok_u = secrets.compare_digest(credentials.username.encode(), APP_USERNAME.encode())
+    ok_p = secrets.compare_digest(credentials.password.encode(), APP_PASSWORD.encode())
+    if not (ok_u and ok_p):
+        raise HTTPException(status_code=401, headers={"WWW-Authenticate": "Basic realm='Tax Research'"})
+    return credentials.username
 
-# ── SSE stream endpoint ───────────────────────────────────────────────────────
-@app.post("/stream")
-async def stream_report(request: Request, _user: str = Depends(auth)):
-    body = await request.json()
-    subject  = body.get("subject", "").strip()
-    mode     = body.get("mode", "sector")
-    sections = body.get("sections", [])
-    sonar    = body.get("sonar_model", "sonar")
+# ─── Markdown → HTML ──────────────────────────────────────────────────────────
+def inline_md(text: str) -> str:
+    text = re.sub(r'\*\*\*(.+?)\*\*\*', r'<strong><em>\1</em></strong>', text)
+    text = re.sub(r'\*\*(.+?)\*\*',     r'<strong>\1</strong>', text)
+    text = re.sub(r'__(.+?)__',          r'<strong>\1</strong>', text)
+    text = re.sub(r'\*(.+?)\*',          r'<em>\1</em>', text)
+    text = re.sub(r'`(.+?)`',            r'<code>\1</code>', text)
+    text = re.sub(r'\[(.+?)\]\((.+?)\)', r'<a href="\2" target="_blank">\1</a>', text)
+    return text
 
-    if not subject:
-        raise HTTPException(400, "Missing subject")
+def parse_pipe_table(lines: list) -> str:
+    rows = []
+    for line in lines:
+        if re.match(r'^\|[-:\s|]+\|$', line.strip()):
+            continue
+        cells = [c.strip() for c in line.strip().strip('|').split('|')]
+        rows.append(cells)
+    if not rows:
+        return ""
+    html = '<table><thead><tr>' + ''.join(f'<th>{inline_md(c)}</th>' for c in rows[0]) + '</tr></thead><tbody>'
+    for row in rows[1:]:
+        html += '<tr>' + ''.join(f'<td>{inline_md(c)}</td>' for c in row) + '</tr>'
+    return html + '</tbody></table>'
 
-    enabled = [s for s in sections if s.get("enabled")]
-    if not enabled:
-        raise HTTPException(400, "No sections enabled")
+def md_to_html(text: str) -> str:
+    lines = text.split('\n')
+    result = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if '|' in stripped and stripped.startswith('|'):
+            tbl = []
+            while i < len(lines) and '|' in lines[i].strip() and lines[i].strip().startswith('|'):
+                tbl.append(lines[i].strip())
+                i += 1
+            result.append(parse_pipe_table(tbl))
+            continue
+        m = re.match(r'^(#{1,6})\s+(.+)$', stripped)
+        if m:
+            lv = len(m.group(1))
+            result.append(f'<h{min(lv,3)}>{inline_md(m.group(2))}</h{min(lv,3)}>')
+            i += 1; continue
+        if re.match(r'^[-*•]\s+', stripped):
+            result.append('<ul>')
+            while i < len(lines) and re.match(r'^[-*•]\s+', lines[i].strip()):
+                item = re.sub(r'^[-*•]\s+', '', lines[i].strip())
+                result.append(f'<li>{inline_md(item)}</li>')
+                i += 1
+            result.append('</ul>')
+            continue
+        if re.match(r'^\d+[.)]\s+', stripped):
+            result.append('<ol>')
+            while i < len(lines) and re.match(r'^\d+[.)]\s+', lines[i].strip()):
+                item = re.sub(r'^\d+[.)] ', '', lines[i].strip())
+                result.append(f'<li>{inline_md(item)}</li>')
+                i += 1
+            result.append('</ol>')
+            continue
+        if not stripped: i += 1; continue
+        if re.match(r'^<[a-zA-Z/]', stripped): result.append(stripped); i += 1; continue
+        result.append(f'<p>{inline_md(stripped)}</p>')
+        i += 1
+    return '\n'.join(result)
 
-    async def generate():
-        def sse(data: dict) -> str:
-            return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+def clean_html(text: str) -> str:
+    text = re.sub(r'```html\s*', '', text)
+    text = re.sub(r'```\s*', '', text)
+    text = re.sub(r'^(#{1,6})\s+(.+)$',
+                  lambda m: f'<h{min(len(m.group(1)),3)}>{m.group(2)}</h{min(len(m.group(1)),3)}>',
+                  text, flags=re.MULTILINE)
+    text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
+    lines = text.split('\n')
+    result = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if '|' in line and line.strip().startswith('|') and not line.strip().startswith('<'):
+            tbl = []
+            while i < len(lines) and '|' in lines[i] and lines[i].strip().startswith('|'):
+                tbl.append(lines[i])
+                i += 1
+            result.append(parse_pipe_table(tbl))
+            continue
+        result.append(line)
+        i += 1
+    return '\n'.join(result)
 
-        yield sse({"type": "ping"})
-        yield sse({"type": "status", "message": f"Đang nghiên cứu '{subject}'..."})
+# ─── Perplexity ───────────────────────────────────────────────────────────────
+async def perplexity_search(query: str, client: httpx.AsyncClient, report_date: datetime,
+                            recency: str = "month") -> dict:
+    """
+    recency: "month" | "year" | None
+    - "month": tin tức/số liệu mới nhất (thị trường, big players, M&A)
+    - "year": văn bản pháp luật mới ban hành gần đây
+    - None: không filter — dùng cho query văn bản nền tảng đang hiệu lực
+    """
+    year = report_date.year
+    prev_year = year - 1
+    payload = {
+        "model": "sonar-pro",   # dùng sonar-pro cho legal queries để chính xác hơn
+        "messages": [
+            {"role": "system", "content": (
+                f"Chuyên gia nghiên cứu pháp luật và thuế Việt Nam. "
+                f"Thời điểm tham chiếu: {report_date.strftime('%m/%Y')}. "
+                f"Liệt kê đầy đủ, chính xác số hiệu văn bản (Luật, Nghị định, Thông tư, Công văn) kèm năm ban hành. "
+                f"KHÔNG suy đoán — chỉ nêu những gì có căn cứ từ nguồn đáng tin cậy. "
+                f"Với văn bản pháp luật: nêu rõ văn bản nào đang hiệu lực, văn bản nào đã bị thay thế/sửa đổi."
+            )},
+            {"role": "user", "content": query}
+        ],
+        "max_tokens": 3000,
+        "temperature": 0.1,
+        "return_citations": True,
+    }
+    if recency:
+        payload["search_recency_filter"] = recency
 
-        # Phase 1: parallel research — Perplexity + thuvienphapluat.vn
-        all_results: dict = {}
-        all_tvpl: dict = {}
-        all_citations: list = []
-        total = len(enabled)
+    headers = {"Authorization": f"Bearer {PERPLEXITY_API_KEY}", "Content-Type": "application/json"}
+    try:
+        r = await client.post(PERPLEXITY_URL, json=payload, headers=headers, timeout=90.0)
+        r.raise_for_status()
+        d = r.json()
+        return {"content": d["choices"][0]["message"]["content"], "citations": d.get("citations", []), "success": True}
+    except Exception as e:
+        return {"content": f"Lỗi: {e}", "citations": [], "success": False}
 
-        for batch_start in range(0, total, 4):
-            batch = enabled[batch_start:batch_start + 4]
+# ─── Default section templates ────────────────────────────────────────────────
+DEFAULT_SECTOR_SECTIONS = [
+    {
+        "id": "overview", "title": "Tổng quan về ngành",
+        "sub": ["Quy mô thị trường, doanh thu toàn ngành (số liệu 2024-2026)", "Đặc điểm kinh doanh, mô hình doanh thu", "Chuỗi cung ứng upstream / downstream"]
+    },
+    {
+        "id": "market", "title": "Thị trường & Big Players",
+        "sub": ["Tăng trưởng ngành 2020-2025 và dự báo 2030", "Top doanh nghiệp lớn nhất (tên, doanh thu, thị phần)", "FDI trong ngành, xu hướng M&A"]
+    },
+    {
+        "id": "legal", "title": "Quy định pháp lý quan trọng",
+        "sub": ["Luật chuyên ngành (số hiệu, năm ban hành, bản mới nhất)", "Nghị định & Thông tư hướng dẫn quan trọng nhất", "Điều kiện kinh doanh, giấy phép đặc thù", "Hạn chế đầu tư nước ngoài (nếu có)"]
+    },
+    {
+        "id": "tax", "title": "Phân tích các loại thuế áp dụng",
+        "sub": ["Thuế TNDN: thuế suất, ưu đãi đặc thù (văn bản 2024-2026)", "Thuế GTGT: thuế suất đặc thù từng sản phẩm/dịch vụ", "Thuế Nhà thầu (FCT): khi nào phát sinh, thuế suất", "Thuế TTĐB (nếu có): đối tượng chịu thuế, thuế suất", "Thuế XNK: MFN, ưu đãi FTA CPTPP/EVFTA/RCEP", "Phí và thuế khác đặc thù ngành"]
+    },
+    {
+        "id": "tax_deep", "title": "Công văn hướng dẫn & Tranh chấp thuế",
+        "sub": ["Công văn của Tổng cục Thuế / Cục Thuế hướng dẫn thuế ngành (số hiệu, nội dung)", "Các vụ thanh tra, truy thu, tranh chấp thuế nổi bật trong ngành", "Vấn đề thường gặp khi quyết toán: marketing, hoa hồng, royalty, chuyển giá"]
+    },
+    {
+        "id": "issues", "title": "Vấn đề thuế đặc thù của ngành",
+        "sub": ["Nhận dạng và ghi nhận doanh thu: rủi ro, tranh chấp", "Chi phí được trừ / không được trừ đặc thù ngành", "Chuyển lỗ, ưu đãi thuế: điều kiện và rủi ro mất ưu đãi", "Hoá đơn chứng từ: rủi ro đặc thù", "Khấu trừ tại nguồn: thuế TNCN, thuế nhà thầu", "Chuyển giá (transfer pricing) với giao dịch liên kết"]
+    },
+    {
+        "id": "international", "title": "Thông lệ & Vấn đề thuế quốc tế",
+        "sub": ["Thông lệ thuế quốc tế cho ngành (Singapore, Thái Lan, Malaysia)", "Tác động BEPS 2.0 / Pillar Two (thuế tối thiểu toàn cầu 15%)", "Rủi ro PE (permanent establishment) phổ biến"]
+    },
+]
 
-            for i, sec in enumerate(batch):
-                yield sse({
-                    "type": "progress",
-                    "step": batch_start + i + 1,
-                    "total": total,
-                    "label": f"Đang nghiên cứu: {sec['title']}",
-                })
+DEFAULT_COMPANY_SECTIONS = [
+    {
+        "id": "co_overview", "title": "Tổng quan về công ty & các sector hoạt động",
+        "sub": ["Lịch sử, quy mô, cơ cấu pháp lý (TNHH/CP/FDI/JV)", "Các ngành/sector mà công ty đang hoạt động", "Doanh thu, lợi nhuận, nhân sự (số liệu mới nhất)"]
+    },
+    {
+        "id": "co_sector_char", "title": "Đặc thù từng sector của công ty",
+        "sub": ["Doanh thu & chi phí của từng sector tạo ra từ đâu", "Chuỗi cung ứng upstream/downstream từng sector", "Đặc thù riêng của công ty so với ngành"]
+    },
+    {
+        "id": "co_growth", "title": "Sự phát triển của công ty & cạnh tranh",
+        "sub": ["Lịch sử phát triển và milestones quan trọng", "Vị trí thị trường, thị phần từng sector", "Đối thủ cạnh tranh chính trong từng sector", "Kế hoạch và xu hướng phát triển 2025-2030"]
+    },
+    {
+        "id": "co_legal", "title": "Quy định pháp lý áp dụng cho công ty",
+        "sub": ["Luật & Nghị định áp dụng cho từng sector công ty hoạt động (văn bản mới nhất 2024-2026)", "Điều kiện kinh doanh & giấy phép đặc thù", "Hạn chế FDI, cơ cấu sở hữu nước ngoài"]
+    },
+    {
+        "id": "co_tax", "title": "Phân tích thuế áp dụng cho từng sector của công ty",
+        "sub": ["Thuế TNDN: thuế suất, ưu đãi đang hưởng, điều kiện (văn bản 2024-2026)", "Thuế GTGT: thuế suất đặc thù sản phẩm/dịch vụ của công ty", "Thuế Nhà thầu, TTĐB, XNK áp dụng", "Giao dịch liên kết: royalty, phí quản lý, vay nội bộ"]
+    },
+    {
+        "id": "co_tax_issues", "title": "Vấn đề thuế đặc thù của công ty",
+        "sub": ["Vấn đề thuế đặc thù từ từng sector hoạt động", "Rủi ro thuế đặc thù của công ty này (đã biết & có thể phát sinh)", "Công văn / thanh tra / truy thu thuế liên quan đến công ty (nếu có)", "Chuyển giá, thin capitalization, royalty với công ty mẹ"]
+    },
+    {
+        "id": "co_international", "title": "Vấn đề thuế quốc tế của công ty",
+        "sub": ["Cấu trúc holding quốc tế, công ty mẹ và BEPS exposure", "Tác động Pillar Two (thuế tối thiểu 15%) với tập đoàn", "Rủi ro PE, withholding tax trong giao dịch xuyên biên giới"]
+    },
+]
 
-            perplexity_tasks = [
-                perplexity_search(build_query(s, subject, mode), sonar)
-                for s in batch
-            ]
-            tvpl_tasks = [
-                tvpl_search(build_tvpl_query(s, subject, mode))
-                if is_legal_or_tax_section(s)
-                else _empty()
-                for s in batch
-            ]
+# ─── Build queries from flexible sections ─────────────────────────────────────
+def sections_to_queries(sections: list, subject_context: str, report_date: datetime) -> list[dict]:
+    """
+    Legal sections (id: legal, co_legal) → 3 queries: inventory table + deep analysis + new 2024+
+    Tax sections (id: tax*, co_tax*) → 3 queries: tax law inventory table + analysis + new 2024+
+    Market/other → 1 query with appropriate recency
+    """
+    year = report_date.year
+    prev_year = year - 1
+    queries = []
 
-            perplexity_results, tvpl_results = await asyncio.gather(
-                asyncio.gather(*perplexity_tasks),
-                asyncio.gather(*tvpl_tasks),
-            )
+    TAX_IDS   = {"tax", "tax_deep", "co_tax", "co_tax_issues"}
+    LEGAL_IDS = {"legal", "co_legal"}
+    MARKET_IDS = {"overview", "market", "co_overview", "co_sector_char", "co_growth"}
 
-            for sec, pres, tres in zip(batch, perplexity_results, tvpl_results):
-                all_results[sec["id"]] = pres
-                all_tvpl[sec["id"]]    = tres or []
-                all_citations.extend(pres.get("citations", []))
-                all_citations.extend(
-                    d.get("url", "") for d in (tres or []) if d.get("url")
+    for sec in sections:
+        sec_id  = sec.get("id", "")
+        title   = sec.get("title", "")
+        subs    = sec.get("sub", [])
+        sub_txt = "\n".join(f"- {s}" for s in subs) if subs else ""
+
+        is_tax    = sec_id in TAX_IDS or any(k in sec_id for k in ["tax", "thue"])
+        is_legal  = sec_id in LEGAL_IDS or any(k in sec_id for k in ["legal", "phap"])
+        is_market = sec_id in MARKET_IDS
+
+        if is_legal:
+            queries.append({
+                "id": f"{sec_id}_inventory",
+                "label": f"{title} — Danh mục văn bản",
+                "recency": None,
+                "query": (
+                    f"Lập DANH MỤC ĐẦY ĐỦ tất cả văn bản pháp luật (Luật, Pháp lệnh, Nghị định, Thông tư, "
+                    f"Quyết định) đang có hiệu lực HOẶC đã ban hành nhưng chưa có hiệu lực, "
+                    f"điều chỉnh hoạt động của doanh nghiệp trong ngành: {subject_context}\n\n"
+                    f"Phạm vi: văn bản liên quan đến đăng ký kinh doanh, điều kiện hoạt động, "
+                    f"quản lý chuyên ngành, lao động, môi trường, cạnh tranh, đầu tư nước ngoài, "
+                    f"sở hữu trí tuệ, và bất kỳ quy định nào ảnh hưởng trực tiếp đến {subject_context}.\n\n"
+                    f"Với MỖI văn bản ghi rõ:\n"
+                    f"- Số hiệu đầy đủ (VD: Luật số 23/2018/QH14)\n"
+                    f"- Tên văn bản\n"
+                    f"- Ngày ban hành và ngày có hiệu lực\n"
+                    f"- Tình trạng: Đang hiệu lực / Chưa có hiệu lực (ghi ngày) / Sắp hết hiệu lực\n"
+                    f"- Lý do liên quan đến {subject_context}\n"
+                    f"KHÔNG giới hạn năm. Bao gồm văn bản từ 2000-2023 nếu vẫn hiệu lực. "
+                    f"Tiếng Việt. Nguồn: thuvienphapluat.vn, luatvietnam.vn, chinhphu.vn."
                 )
-                tvpl_note = f" (+{len(tres)} văn bản PL)" if tres else ""
-                yield sse({
-                    "type": "progress",
-                    "step": batch_start + batch.index(sec) + 1,
-                    "total": total,
-                    "label": f"Xong research: {sec['title']}{tvpl_note}",
-                })
-
-        # Phase 2: Claude per section
-        yield sse({"type": "ai_start", "total": len(enabled)})
-        full_html = ""
-
-        for i, section in enumerate(enabled):
-            yield sse({
-                "type": "status",
-                "message": f"AI đang viết phần {i + 1}/{len(enabled)}: {section['title']}",
             })
-            ctx = filter_context(all_results, section)
+            queries.append({
+                "id": f"{sec_id}_foundation",
+                "label": f"{title} — Phân tích chi tiết",
+                "recency": None,
+                "query": (
+                    f"Phân tích chi tiết các quy định pháp lý quan trọng nhất áp dụng cho: {subject_context}\n"
+                    f"Nội dung:\n{sub_txt}\n\n"
+                    f"Yêu cầu: điều kiện kinh doanh, giấy phép, hạn chế FDI, compliance obligations, "
+                    f"chế tài vi phạm. Không giới hạn năm. Dẫn số hiệu cụ thể. Tiếng Việt."
+                )
+            })
+            queries.append({
+                "id": f"{sec_id}_new",
+                "label": f"{title} — Mới & Sắp hiệu lực {prev_year}-{year}",
+                "recency": "year",
+                "query": (
+                    f"Văn bản pháp luật MỚI BAN HÀNH hoặc SẮP CÓ HIỆU LỰC trong {prev_year}-{year} "
+                    f"liên quan đến: {subject_context}\n"
+                    f"Tìm: Luật mới, sửa đổi Luật, Nghị định, Thông tư mới. "
+                    f"Ghi rõ ngày có hiệu lực và nội dung thay đổi chính. Tiếng Việt."
+                )
+            })
 
-            # Prepend TVPL legal docs for law/tax sections
-            tvpl_docs = all_tvpl.get(section["id"], [])
-            if tvpl_docs and is_legal_or_tax_section(section):
-                tvpl_text = format_tvpl_results(tvpl_docs)
-                if tvpl_text:
-                    ctx = tvpl_text + "\n\n" + ctx
+        elif is_tax:
+            queries.append({
+                "id": f"{sec_id}_inventory",
+                "label": f"{title} — Danh mục văn bản thuế",
+                "recency": None,
+                "query": (
+                    f"Lập DANH MỤC ĐẦY ĐỦ tất cả văn bản pháp luật về THUẾ (Luật thuế, Nghị định, "
+                    f"Thông tư Bộ Tài chính/Tổng cục Thuế) đang có hiệu lực HOẶC đã ban hành "
+                    f"nhưng chưa có hiệu lực, áp dụng cho doanh nghiệp ngành: {subject_context}\n\n"
+                    f"Bao gồm ĐẦY ĐỦ tất cả:\n"
+                    f"1. Thuế TNDN: Luật số 14/2008/QH12 và các sửa đổi, Luật mới (nếu có), "
+                    f"   Nghị định 218/2013, các sửa đổi, Thông tư 78/2014 và các sửa đổi\n"
+                    f"2. Thuế GTGT: Luật số 13/2008/QH12 và các sửa đổi, Luật mới (nếu có), "
+                    f"   Nghị định 209/2013, các sửa đổi, Thông tư 219/2013 và các sửa đổi\n"
+                    f"3. Thuế TNCN: Luật số 04/2007/QH12 và các sửa đổi, hướng dẫn liên quan ngành\n"
+                    f"4. Thuế Nhà thầu: Thông tư 103/2014/TT-BTC và sửa đổi\n"
+                    f"5. Thuế TTĐB (nếu áp dụng): Luật và sửa đổi\n"
+                    f"6. Thuế XNK, FTA (nếu áp dụng)\n"
+                    f"7. Quản lý thuế: Luật số 38/2019/QH14, Nghị định, Thông tư\n"
+                    f"8. Hóa đơn: Nghị định 123/2020, Thông tư 78/2021 và sửa đổi\n"
+                    f"9. Giao dịch liên kết: Nghị định 132/2020 và sửa đổi\n"
+                    f"10. Ưu đãi thuế đặc thù ngành {subject_context}\n\n"
+                    f"Với MỖI văn bản: số hiệu, tên, ngày ban hành, ngày hiệu lực, "
+                    f"tình trạng (hiệu lực/chưa hiệu lực/đã được sửa đổi bởi...), "
+                    f"nội dung chính liên quan {subject_context}.\n"
+                    f"KHÔNG bỏ sót văn bản dù ban hành từ 2003. Tiếng Việt. "
+                    f"Nguồn: thuvienphapluat.vn, mof.gov.vn, gdt.gov.vn."
+                )
+            })
+            queries.append({
+                "id": f"{sec_id}_foundation",
+                "label": f"{title} — Phân tích chi tiết",
+                "recency": None,
+                "query": (
+                    f"Phân tích chi tiết quy định thuế áp dụng cho: {subject_context}\n"
+                    f"Nội dung:\n{sub_txt}\n\n"
+                    f"Yêu cầu: thuế suất cụ thể, điều kiện ưu đãi, công văn hướng dẫn TCT/Bộ TC, "
+                    f"rủi ro thuế phổ biến, vụ thanh tra/tranh chấp nổi bật. "
+                    f"Không giới hạn năm. Tiếng Việt."
+                )
+            })
+            queries.append({
+                "id": f"{sec_id}_new",
+                "label": f"{title} — Thay đổi thuế {prev_year}-{year}",
+                "recency": "year",
+                "query": (
+                    f"Thay đổi THUẾ quan trọng nhất trong {prev_year}-{year} "
+                    f"ảnh hưởng đến doanh nghiệp ngành: {subject_context}\n"
+                    f"Tìm: Luật thuế mới, sửa đổi Luật TNDN/GTGT/QLT, Nghị định mới, Thông tư mới nhất. "
+                    f"Ghi rõ ngày hiệu lực và tác động. Tiếng Việt."
+                )
+            })
 
-            # Inject citation URLs so Claude can use real links
-            section_citations = all_results.get(section["id"], {}).get("citations", [])
-            tvpl_urls = [d.get("url","") for d in tvpl_docs if d.get("url")]
-            all_section_urls = section_citations + tvpl_urls
-            if all_section_urls:
-                url_list = "\n".join(f"[{i+1}] {u}" for i,u in enumerate(all_section_urls[:20]))
-                ctx = f"=== DANH SÁCH URL NGUỒN (dùng cho citation) ===\n{url_list}\n\n" + ctx
+        else:
+            recency = "month" if is_market else "year"
+            queries.append({
+                "id": sec_id,
+                "label": title,
+                "recency": recency,
+                "query": (
+                    f"Nghiên cứu chuyên sâu về: {title}\n"
+                    f"Đối tượng: {subject_context}\n"
+                    f"Nội dung:\n{sub_txt}\n\n"
+                    f"Yêu cầu: Tiếng Việt. Số liệu mới nhất. Nêu nguồn và năm."
+                )
+            })
 
-            sec_html = ""
+    return queries
 
-            async for chunk in claude_stream_section(section, subject, ctx, mode, i + 1):
-                yield sse({"type": "chunk", "text": chunk})
-                sec_html += chunk
-                await asyncio.sleep(0)
+# ─── Save helpers ─────────────────────────────────────────────────────────────
+def save_report_local(subject: str, html: str, sources: list) -> str:
+    now = datetime.now()
+    date_str = now.strftime("%Y%m%d")
+    safe_name = re.sub(r'[^\w\s\-]', '', subject).strip()[:50]
+    # Find next sequential number for today
+    existing = list(REPORTS_DIR.glob(f"{date_str} - *.html"))
+    seq = len(existing) + 1
+    fname = f"{date_str} - {safe_name} - {seq}.html"
+    sources_html = ''.join(f'<li><a href="{u}">{u}</a></li>' for u in sources)
+    full = f"""<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8">
+<title>Báo cáo thuế — {subject}</title>
+<style>
+body{{font-family:Arial,sans-serif;max-width:900px;margin:40px auto;padding:0 20px;color:#1f2937}}
+h2{{color:#028a39;border-bottom:2px solid #a7d9b8;padding-bottom:6px;margin-top:2rem;font-size:1.3rem}}
+h3{{color:#016d2d;margin-top:1.2rem}}
+p{{line-height:1.85;margin-bottom:.6rem;font-size:.975rem}}
+ul{{list-style:disc;margin-left:1.5rem;margin-bottom:.75rem}}
+ul ul{{list-style:circle;margin-left:1.5rem;margin-top:.25rem}}
+ul ul ul{{list-style:square;margin-left:1.5rem}}
+ol{{list-style:decimal;margin-left:1.5rem;margin-bottom:.75rem}}
+li{{margin-bottom:.35rem;line-height:1.75;font-size:.95rem}}
+table{{width:100%;border-collapse:collapse;margin:1rem 0;font-size:.9rem}}
+th{{background:#028a39;color:#fff;padding:.5rem .75rem;text-align:left}}
+td{{padding:.4rem .75rem;border-bottom:1px solid #e5e7eb}}
+tr:nth-child(even) td{{background:#e6f4ec}}
+.footer{{margin-top:2rem;font-size:.75rem;color:#9ca3af;font-style:italic;border-top:1px solid #e5e7eb;padding-top:1rem}}
+</style></head><body>
+<div style="background:#028a39;color:white;padding:20px;border-radius:8px;margin-bottom:2rem">
+<div style="font-size:.75rem;opacity:.8;margin-bottom:4px">TAX RESEARCH REPORT</div>
+<h1 style="margin:0;font-size:1.5rem;color:white">Phân Tích Thuế — {subject}</h1>
+<div style="opacity:.8;font-size:.85rem;margin-top:6px">{now.strftime("%d/%m/%Y %H:%M")}</div>
+</div>
+{html}
+<div class="footer"><strong>Nguồn tham khảo ({len(sources)} links):</strong><ol>{sources_html}</ol>
+Báo cáo tổng hợp tự động bởi AI. Mang tính tham khảo.</div>
+</body></html>"""
+    (REPORTS_DIR / fname).write_text(full, encoding="utf-8")
+    return fname
 
-            full_html += sec_html + "\n"
-            yield sse({"type": "ping"})
+# ─── SSE stream ───────────────────────────────────────────────────────────────
 
-        # Citations
-        unique_urls = list(dict.fromkeys(all_citations))
-        yield sse({"type": "citations", "urls": unique_urls})
+async def claude_stream_httpx(system: str, user_prompt: str, max_tokens: int = 12000):
+    """Stream Claude via raw httpx — no SDK timeout issues."""
+    headers = {
+        "Authorization": f"Bearer {CLAUDIBLE_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": CLAUDIBLE_MODEL,
+        "max_tokens": max_tokens,
+        "stream": True,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user_prompt}
+        ]
+    }
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=15, read=300, write=60, pool=30)) as client:
+        async with client.stream("POST", CLAUDIBLE_ENDPOINT, headers=headers, json=payload) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                    text = chunk["choices"][0]["delta"].get("content", "")
+                    if text:
+                        yield text
+                except Exception:
+                    continue
 
-        # Linkify any bare [N] citations
-        unique_citations = list(dict.fromkeys(all_citations))
-        full_html = linkify_citations(full_html, unique_citations)
 
-        # Save
-        try:
-            filename = save_report(subject, full_html)
-        except Exception:
-            filename = None
+async def claude_call_httpx(system: str, user_prompt: str, max_tokens: int = 8000) -> str:
+    """Non-streaming Claude call via raw httpx."""
+    headers = {
+        "Authorization": f"Bearer {CLAUDIBLE_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": CLAUDIBLE_MODEL,
+        "max_tokens": max_tokens,
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user_prompt}
+        ]
+    }
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=15, read=120, write=60, pool=30)) as client:
+        resp = await client.post(CLAUDIBLE_ENDPOINT, headers=headers, json=payload)
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
 
-        yield sse({"type": "done", "filename": filename, "drive": False})
+async def generate_report_stream(mode: str, subject: str, sections: list):
+    try:
+        report_date = datetime.now()
+        yield f"data: {json.dumps({'type':'status','message':f'Bắt đầu nghiên cứu: {subject}...'},ensure_ascii=False)}\n\n"
 
+        queries = sections_to_queries(sections, subject, report_date)
+        research = {}
+        citations_all = []
+        total = len(queries)
+
+        # ── Parallel Perplexity queries (asyncio.gather) ──────────────────────
+        # Group: market/overview queries run fully parallel;
+        # legal/tax queries run in small batches to avoid rate limits
+        BATCH = 4  # max concurrent requests
+        async with httpx.AsyncClient() as client:
+            yield f"data: {json.dumps({'type':'progress','step':0,'total':total,'label':'Đang khởi động...'},ensure_ascii=False)}\n\n"
+            for batch_start in range(0, total, BATCH):
+                batch = queries[batch_start:batch_start+BATCH]
+                tasks = [perplexity_search(q["query"], client, report_date, recency=q.get("recency","month")) for q in batch]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for q, res in zip(batch, results):
+                    if isinstance(res, Exception):
+                        res = {"content": f"[Lỗi: {res}]", "citations": [], "success": False}
+                    research[q["id"]] = res
+                    for u in res.get("citations", []):
+                        if u not in citations_all:
+                            citations_all.append(u)
+                done_so_far = min(batch_start + BATCH, total)
+                yield f"data: {json.dumps({'type':'progress','step':done_so_far,'total':total,'label':batch[-1]['label']},ensure_ascii=False)}\n\n"
+                if batch_start + BATCH < total:
+                    await asyncio.sleep(0.5)  # brief pause between batches
+                yield 'data: {"type":"ping"}\n\n'
+
+        yield f"data: {json.dumps({'type':'ai_start','total':total},ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps({'type':'status','message':'Tổng hợp báo cáo với Claude AI...'},ensure_ascii=False)}\n\n"
+
+        # Group research by base section id for synthesis
+        ctx_parts = []
+        seen_bases = []
+        for q in queries:
+            base_id = q["id"].replace("_foundation","").replace("_new","")
+            if base_id not in seen_bases:
+                seen_bases.append(base_id)
+                # Gather all queries for this base section
+                related = [r for r in queries if r["id"].replace("_foundation","").replace("_new","") == base_id]
+                combined = "\n\n".join(
+                    f"[{r['label'].upper()}]\n{research.get(r['id'],{}).get('content','(không có dữ liệu)')}"
+                    for r in related
+                )
+                ctx_parts.append(combined)
+        ctx = "\n\n" + "="*60 + "\n\n".join(ctx_parts)
+        # Build sections structure from ORIGINAL sections (not expanded queries)
+        sections_structure = "\n".join(
+            f"<h2>{i+1}. {sec['title']}</h2>\n" +
+            ("\n".join(f"  (bao gồm: {s})" for s in sec.get("sub",[])))
+            for i, sec in enumerate(sections)
+        )
+        # Build citation map: URL index → short label
+        citation_map = {url: i+1 for i, url in enumerate(citations_all)}
+        citations_json = json.dumps(citation_map, ensure_ascii=False)
+
+        prompt = f"""Viết báo cáo phân tích thuế chuyên sâu cho: {subject}
+Thời điểm báo cáo: {report_date.strftime("%m/%Y")}
+
+CẤU TRÚC BÁO CÁO — {len(sections)} phần:
+{sections_structure}
+
+HƯỚNG DẪN PHẦN PHÁP LÝ (section "Quy định pháp lý") — BẮT BUỘC:
+Ở ĐẦU phần này, tạo bảng HTML đầy đủ với CỘT: Số hiệu | Tên văn bản | Loại | Ngày hiệu lực | Tình trạng | Liên quan đến ngành/công ty
+- Liệt kê TẤT CẢ văn bản từ dữ liệu inventory, không bỏ sót
+- Văn bản chưa có hiệu lực: ghi ngày hiệu lực tương lai, tô màu <span style="color:#d97706">Chưa hiệu lực</span>
+- Văn bản mới {report_date.year-1}-{report_date.year}: <strong style="color:#028a39">MỚI</strong>
+- Sau bảng: phân tích chi tiết theo chủ đề
+
+HƯỚNG DẪN PHẦN THUẾ (section "Phân tích thuế") — BẮT BUỘC:
+Ở ĐẦU phần này, tạo bảng HTML đầy đủ với CỘT: Loại thuế | Văn bản gốc | Văn bản sửa đổi mới nhất | Ngày hiệu lực | Thuế suất / Nội dung chính | Đặc thù ngành
+- Bao gồm ĐẦY ĐỦ: TNDN, GTGT, TNCN, Nhà thầu, TTĐB, XNK, QLT, Hóa đơn, Giao dịch liên kết, Ưu đãi
+- Văn bản cũ vẫn hiệu lực (2003-2023): PHẢI liệt kê, ghi "đang hiệu lực"
+- Văn bản mới thay thế: ghi rõ thay thế văn bản nào
+- Sau bảng: phân tích chi tiết theo từng loại thuế
+
+QUY TẮC CHUNG:
+- Tổng hợp CẢ BA nguồn (inventory + foundation + new) cho mỗi phần
+- KHÔNG bỏ sót văn bản quan trọng dù ban hành trước 2024
+- KHÔNG tự thêm số hiệu không có trong dữ liệu nghiên cứu
+- Văn bản mới {report_date.year-1}-{report_date.year}: highlight bằng <strong>
+
+CITATIONS INLINE:
+Khi trích dẫn thông tin từ nguồn, thêm link inline: <a href="URL_NGUON" target="_blank" style="color:#028a39;font-size:.75em">[N]</a>
+Danh sách URL theo thứ tự: {citations_json}
+
+DỮ LIỆU NGHIÊN CỨU:
+{ctx}
+
+FORMAT BẮT BUỘC: HTML thuần. KHÔNG markdown. Bullet nhiều cấp = <ul> lồng nhau. Bắt đầu ngay bằng <h2>."""
+
+        report_html = ""
+        if not CLAUDIBLE_API_KEY:
+            for q in queries:
+                report_html += f"<h2>{q['label']}</h2>{md_to_html(research.get(q['id'],{}).get('content',''))}"
+            yield f"data: {json.dumps({'type':'report','html':report_html},ensure_ascii=False)}\n\n"
+        else:
+            # ── Per-section calls: nhỏ hơn → không bị token limit ──────────────
+            system_prompt = build_report_system_prompt()
+            total_sec = len(sections)
+            for sec_idx, sec in enumerate(sections):
+                sec_title = sec["title"]
+                sec_subs  = sec.get("sub", [])
+                yield f"data: {json.dumps({'type':'status','message':f'Claude đang viết: {sec_title}...'},ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'type':'progress','step':total+sec_idx+1,'total':total+total_sec,'label':f'Viết: {sec_title}'},ensure_ascii=False)}\n\n"
+
+                sub_hint = ("\nBao gồm các nội dung: " + ", ".join(sec_subs)) if sec_subs else ""
+                # Pick relevant research context for this section (filtered)
+                keyword_map = {
+                    "tổng quan": ["overview","general"],
+                    "đặc thù": ["overview","market"],
+                    "phát triển": ["market","players"],
+                    "players": ["market","players"],
+                    "quy định": ["legal","regulations"],
+                    "pháp lý": ["legal","regulations"],
+                    "phân tích thuế": ["tax","vat","cit"],
+                    "vấn đề thuế": ["issues","risks","tax"],
+                    "đặc thù ngành": ["issues","risks"],
+                    "quốc tế": ["international","global"],
+                    "thông lệ": ["international","global"],
+                }
+                sec_title_lower = sec_title.lower()
+                # Find matching research keys
+                matched_keys = []
+                for kw, res_keys in keyword_map.items():
+                    if kw in sec_title_lower:
+                        matched_keys.extend(res_keys)
+                
+                # Build filtered context — only relevant research parts
+                ctx_parts_filtered = []
+                for part in ctx_parts:
+                    part_lower = part.lower()
+                    if not matched_keys or any(k in part_lower[:200] for k in matched_keys):
+                        ctx_parts_filtered.append(part[:3000])  # cap each part
+                
+                sec_ctx = ("\n\n" + "="*40 + "\n\n").join(ctx_parts_filtered) if ctx_parts_filtered else ctx[:5000]
+
+                sec_prompt = f"""Viết PHẦN "{sec_title}" trong báo cáo phân tích thuế cho: {subject} ({report_date.strftime("%m/%Y")}){sub_hint}
+
+QUY TẮC:
+- Viết đầy đủ, chuyên sâu, ít nhất 600 từ
+- Dùng HTML thuần (h3, p, ul, li, table, strong, em) — KHÔNG markdown
+- Bắt đầu ngay bằng <h2>{sec_idx+1}. {sec_title}</h2>
+- Trích dẫn văn bản pháp luật cụ thể khi có (số hiệu, năm)
+{"- Tạo bảng HTML đầy đủ ở đầu phần nếu là phần Pháp lý hoặc Thuế" if any(k in sec_title.lower() for k in ["quy định","pháp lý","thuế","legal","tax"]) else ""}
+
+DỮ LIỆU NGHIÊN CỨU:
+{sec_ctx[:6000]}"""
+
+                sec_html = ""
+                MAX_RETRIES = 2
+                for attempt in range(MAX_RETRIES + 1):
+                    try:
+                        async for text in claude_stream_httpx(system_prompt, sec_prompt, max_tokens=2000):
+                            sec_html += text
+                            report_html += text
+                            yield f"data: {json.dumps({'type':'chunk','text':text},ensure_ascii=False)}\n\n"
+                        yield 'data: {"type":"ping"}\n\n'
+                        break
+                    except Exception as e:
+                        if attempt < MAX_RETRIES:
+                            yield f"data: {json.dumps({'type':'status','message':f'Lỗi phần {sec_title}, thử lại...'},ensure_ascii=False)}\n\n"
+                            await asyncio.sleep(2)
+                            report_html = report_html[:-len(sec_html)]
+                            sec_html = ""
+                            continue
+                        else:
+                            report_html += f"<h2>{sec_idx+1}. {sec_title}</h2><p><em>[Lỗi tạo nội dung phần này]</em></p>"
+                            yield f"data: {json.dumps({'type':'chunk','text':f'<h2>{sec_idx+1}. {sec_title}</h2><p><em>[Lỗi]</em></p>'},ensure_ascii=False)}\n\n"
+
+        report_html = clean_html(report_html)
+        fname = save_report_local(subject, report_html, citations_all)
+
+        yield f"data: {json.dumps({'type':'citations','urls':citations_all},ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps({'type':'done','filename':fname,'drive':False},ensure_ascii=False)}\n\n"
+
+    except Exception as e:
+        yield f"data: {json.dumps({'type':'error','message':str(e)},ensure_ascii=False)}\n\n"
+
+# ─── Endpoints ────────────────────────────────────────────────────────────────
+@app.get("/", response_class=HTMLResponse)
+async def index(user: str = Depends(check_auth)):
+    return HTML_PAGE
+
+@app.post("/stream")
+async def stream_report(request_body: dict, user: str = Depends(check_auth)):
+    mode     = request_body.get("mode", "sector")
+    subject  = request_body.get("subject", "")
+    sections = request_body.get("sections", [])
+    if not subject or not sections:
+        raise HTTPException(400, "Missing subject or sections")
     return StreamingResponse(
-        generate(),
+        generate_report_stream(mode, subject, sections),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-transform",
             "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
-        },
+            "X-Content-Type-Options": "nosniff",
+        }
     )
 
-# ── Default sections ──────────────────────────────────────────────────────────
 @app.get("/default-sections")
-def default_sections(mode: str = "sector", _user: str = Depends(auth)):
-    return SECTOR_SECTIONS_VI if mode == "sector" else COMPANY_SECTIONS_VI
+async def get_default_sections(mode: str = "sector", user: str = Depends(check_auth)):
+    data = DEFAULT_SECTOR_SECTIONS if mode == "sector" else DEFAULT_COMPANY_SECTIONS
+    return JSONResponse(data)
 
-# ── Suggest subsections ───────────────────────────────────────────────────────
-@app.post("/suggest-subsections")
-async def suggest_subsections(request: Request, _user: str = Depends(auth)):
-    body = await request.json()
-    title   = body.get("title", "")
-    subject = body.get("subject", "")
-
-    if not ANTHROPIC_KEY:
-        return {"suggestions": []}
-
-    prompt = (
-        f'Đề xuất 4-5 chủ đề con phù hợp cho phần "{title}" '
-        f'trong báo cáo phân tích thuế về: {subject}\n'
-        f'Trả về JSON array, ví dụ: ["Chủ đề 1", "Chủ đề 2"]\n'
-        f'Chỉ trả về JSON array, không giải thích thêm.'
-    )
-    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
-    try:
-        msg = await client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=300,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        content = msg.content[0].text
-        match = re.search(r'\[.*\]', content, re.DOTALL)
-        suggestions = json.loads(match.group()) if match else []
-    except Exception:
-        suggestions = []
-    return {"suggestions": suggestions}
-
-# ── AI Section Recommender ────────────────────────────────────────────────────
-@app.post("/recommend-sections")
-async def recommend_sections(request: Request, _user: str = Depends(auth)):
-    body    = await request.json()
-    subject = body.get("subject", "").strip()
-    mode    = body.get("mode", "sector")
-
-    if not subject:
-        raise HTTPException(400, "Missing subject")
-    if not ANTHROPIC_KEY:
-        return {"sections": SECTOR_SECTIONS_VI if mode == "sector" else COMPANY_SECTIONS_VI}
-
-    mode_ctx = "ngành/lĩnh vực" if mode == "sector" else "công ty"
-    prompt = f"""Bạn là chuyên gia tư vấn thuế Big 4 (Deloitte/PwC/EY/KPMG) với 20 năm kinh nghiệm.
-
-Nhà tư vấn thuế cần nghiên cứu về {mode_ctx}: **{subject}**
-
-Hãy đề xuất cấu trúc báo cáo phân tích thuế TỐI ƯU cho đối tượng này.
-Dựa trên đặc thù của {subject}, hãy:
-1. Xác định các section quan trọng nhất (5-8 section)
-2. Với mỗi section, liệt kê 4-6 sub-items CỤ THỂ cho {subject} (không chung chung)
-3. Đặc biệt chú ý các vấn đề thuế đặc thù, rủi ro cao, hoặc quy định mới nhất cho ngành/công ty này
-
-Trả về JSON ARRAY theo format sau, KHÔNG giải thích thêm:
-[
-  {{
-    "id": "s1",
-    "title": "Tên section tiếng Việt",
-    "sub": ["sub-item 1 cụ thể", "sub-item 2 cụ thể"],
-    "enabled": true
-  }}
-]
-
-Chỉ trả về JSON array, bắt đầu bằng [ và kết thúc bằng ]."""
-
-    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
-    try:
-        msg = await client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=2000,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        content = msg.content[0].text.strip()
-        match = re.search(r'\[.*\]', content, re.DOTALL)
-        if match:
-            sections = json.loads(match.group())
-            for i, s in enumerate(sections):
-                if "id" not in s:
-                    s["id"] = f"r{i+1}"
-                if "enabled" not in s:
-                    s["enabled"] = True
-            return {"sections": sections, "ai_recommended": True}
-        else:
-            return {"sections": SECTOR_SECTIONS_VI if mode == "sector" else COMPANY_SECTIONS_VI}
-    except Exception as e:
-        return {"sections": SECTOR_SECTIONS_VI if mode == "sector" else COMPANY_SECTIONS_VI,
-                "error": str(e)}
-
-# ── Reports ───────────────────────────────────────────────────────────────────
 @app.get("/reports")
-def list_reports(_user: str = Depends(auth)):
-    reports = []
-    for f in sorted(REPORTS_DIR.glob("*.html"), key=lambda x: x.stat().st_mtime, reverse=True):
-        stat = f.stat()
-        size = f"{stat.st_size // 1024} KB" if stat.st_size >= 1024 else f"{stat.st_size} B"
-        reports.append({
-            "name": f.name,
-            "date": datetime.fromtimestamp(stat.st_mtime).strftime("%d/%m/%Y %H:%M"),
-            "size": size,
-        })
-    return reports
+async def list_reports(user: str = Depends(check_auth)):
+    files = sorted(REPORTS_DIR.glob("*.html"), key=lambda f: f.stat().st_mtime, reverse=True)
+    return JSONResponse([{"name":f.name,"size":f.stat().st_size,"mtime":f.stat().st_mtime,"url":f"/report/{f.name}"} for f in files[:50]])
 
-@app.get("/report/{name:path}")
-def get_report(name: str, _user: str = Depends(auth)):
-    path = (REPORTS_DIR / name).resolve()
-    try:
-        path.relative_to(REPORTS_DIR.resolve())
-    except ValueError:
-        raise HTTPException(400, "Invalid path")
-    if not path.exists():
+@app.delete("/report/{fname}")
+async def delete_report(fname: str, user: str = Depends(check_auth)):
+    path = REPORTS_DIR / fname
+    if not path.exists() or not path.name.endswith(".html"):
+        raise HTTPException(404)
+    path.unlink()
+    return JSONResponse({"ok": True})
+
+@app.get("/report/{fname}", response_class=HTMLResponse)
+async def get_report(fname: str, user: str = Depends(check_auth)):
+    path = REPORTS_DIR / fname
+    if not path.exists() or not path.name.endswith(".html"):
         raise HTTPException(404)
     return HTMLResponse(path.read_text(encoding="utf-8"))
 
-@app.delete("/report/{name:path}")
-def delete_report(name: str, _user: str = Depends(auth)):
-    path = (REPORTS_DIR / name).resolve()
+
+@app.post("/slides")
+async def generate_slides(request_body: dict, user: str = Depends(check_auth)):
+    html    = request_body.get("html", "")
+    subject = request_body.get("subject", "Báo cáo")
+    if not html:
+        raise HTTPException(400, "Missing html")
+
+    if not CLAUDIBLE_API_KEY:
+        raise HTTPException(503, "Claude API not configured")
+
+    prompt = f"""Chuyển báo cáo phân tích thuế sau thành bộ slides trình bày chuyên nghiệp.
+
+CHỦ ĐỀ: {subject}
+
+YÊU CẦU:
+- Tạo 12-15 slides bằng tiếng Việt dùng reveal.js
+- Mỗi slide: thẻ <section>
+- Nội dung súc tích, tối đa 5-6 bullet points mỗi slide
+- Highlight số liệu và điểm quan trọng bằng <span style="color:#028a39;font-weight:bold">
+
+CẤU TRÚC SLIDES:
+1. Title slide: tên ngành/công ty, ngày, "Phân Tích Thuế — Tax Research Report"
+2-3. Tóm tắt key findings & số liệu nổi bật
+4-12. Mỗi section h2 trong báo cáo = 1-2 slides với bullet points
+13. Regulatory summary: bảng tóm tắt văn bản quan trọng nhất (3-5 văn bản)
+14. Risk & lưu ý quan trọng
+15. Disclaimer & nguồn tham khảo
+
+OUTPUT: Trả về TOÀN BỘ HTML page với reveal.js CDN. Bắt đầu bằng <!DOCTYPE html>.
+Dùng theme white. Primary color #028a39. Font tiếng Việt.
+
+NỘI DUNG BÁO CÁO:
+{html[:8000]}"""
+
+    system = """Bạn là chuyên gia thiết kế presentation thuế chuyên nghiệp.
+Tạo slides reveal.js hoàn chỉnh, đẹp, professional.
+Output PHẢI là HTML page hoàn chỉnh bắt đầu bằng <!DOCTYPE html> và kết thúc bằng </html>.
+KHÔNG thêm markdown, KHÔNG thêm giải thích ngoài HTML."""
+
     try:
-        path.relative_to(REPORTS_DIR.resolve())
-    except ValueError:
-        raise HTTPException(400, "Invalid path")
-    if not path.exists():
-        raise HTTPException(404)
-    path.unlink()
-    return {"ok": True}
+        slides_html = (await claude_call_httpx(system, prompt, max_tokens=8000)).strip()
+        # Strip markdown if any
+        if slides_html.startswith("```"):
+            slides_html = slides_html.split("\n",1)[1].rsplit("```",1)[0]
+        return HTMLResponse(slides_html)
+    except Exception as e:
+        raise HTTPException(500, f"Claude error: {e}")
 
-# ── DOCX export ───────────────────────────────────────────────────────────────
+
+
+
 @app.post("/docx")
-async def export_docx(request: Request, _user: str = Depends(auth)):
-    body    = await request.json()
-    html    = body.get("html", "")
-    subject = body.get("subject", "Báo cáo")
+async def export_docx(request_body: dict, user: str = Depends(check_auth)):
+    """Convert report HTML to DOCX and return as download."""
+    from fastapi.responses import Response
+    html    = request_body.get("html", "")
+    subject = request_body.get("subject", "Báo cáo")
+    if not html:
+        raise HTTPException(400, "Missing html")
+    if not DOCX_OK:
+        raise HTTPException(503, "python-docx not installed")
 
-    doc = Document()
+    doc = DocxDocument()
+    # Title
     title_para = doc.add_heading(f"Phân Tích Thuế — {subject}", 0)
-    if title_para.runs:
-        title_para.runs[0].font.color.rgb = RGBColor(0x02, 0x8A, 0x39)
-    doc.add_paragraph(f"Ngày tạo: {datetime.now().strftime('%d/%m/%Y')}")
+    title_para.runs[0].font.color.rgb = RGBColor(0x02, 0x8a, 0x39)
+    doc.add_paragraph(f"Ngày tạo: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    doc.add_paragraph("Nguồn: Perplexity Sonar + Claude AI | taxsector.gpt4vn.com")
+    doc.add_paragraph()
 
-    soup = BeautifulSoup(html, "html.parser")
-    # Insert spaces around inline tags to prevent word merging
-    for tag in soup.find_all(["a", "strong", "em", "span", "b", "i"]):
-        tag.insert_before(" ")
-        tag.insert_after(" ")
-    for el in soup.find_all(["h2", "h3", "p", "li", "table"]):
-        text = " ".join(el.get_text(" ", strip=False).split())  # normalize whitespace
-        if not text:
-            continue
-        tag = el.name
-        if tag == "h2":
-            p = doc.add_heading(text, level=1)
-            if p.runs:
-                p.runs[0].font.color.rgb = RGBColor(0x02, 0x8A, 0x39)
-        elif tag == "h3":
-            doc.add_heading(text, level=2)
-        elif tag == "p":
-            doc.add_paragraph(text)
-        elif tag == "li":
-            doc.add_paragraph(text, style="List Bullet")
-        elif tag == "table":
-            rows = el.find_all("tr")
-            if not rows:
-                continue
-            cols = max(len(r.find_all(["th", "td"])) for r in rows)
-            if cols == 0:
-                continue
-            t = doc.add_table(rows=0, cols=cols)
-            t.style = "Table Grid"
-            for row in rows:
-                cells = row.find_all(["th", "td"])
-                row_cells = t.add_row().cells
-                for j, cell in enumerate(cells[:cols]):
-                    row_cells[j].text = cell.get_text(strip=True)
+    # Parse HTML
+    from html.parser import HTMLParser
+    class DocxBuilder(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.current_tag = None
+            self.current_para = None
+            self.text_buf = ""
+            self.skip_tags = {"script","style","a"}
+            self.in_skip = False
+            self.in_table = False
+            self.table_rows = []
+            self.current_row = []
+            self.is_header_row = False
 
-    buf = io.BytesIO()
+        def handle_starttag(self, tag, attrs):
+            self.current_tag = tag
+            if tag in self.skip_tags:
+                self.in_skip = True
+            elif tag == "table":
+                self.in_table = True
+                self.table_rows = []
+            elif tag == "tr":
+                self.current_row = []
+            elif tag in ("th",):
+                self.is_header_row = True
+
+        def handle_endtag(self, tag):
+            if tag in self.skip_tags:
+                self.in_skip = False
+            elif tag in ("h2","h3","h4","p","li"):
+                t = self.text_buf.strip()
+                if t:
+                    if self.current_tag == "h2" or tag == "h2":
+                        h = doc.add_heading(t, level=1)
+                        h.runs[0].font.color.rgb = RGBColor(0x02, 0x8a, 0x39)
+                    elif tag == "h3":
+                        h = doc.add_heading(t, level=2)
+                        h.runs[0].font.color.rgb = RGBColor(0x01, 0x6d, 0x2d)
+                    elif tag == "h4":
+                        doc.add_heading(t, level=3)
+                    elif tag == "li":
+                        p = doc.add_paragraph(t, style="List Bullet")
+                        p.runs[0].font.size = Pt(11) if p.runs else None
+                    else:
+                        p = doc.add_paragraph(t)
+                        if p.runs:
+                            p.runs[0].font.size = Pt(11)
+                self.text_buf = ""
+            elif tag in ("td","th"):
+                self.current_row.append(self.text_buf.strip())
+                self.text_buf = ""
+            elif tag == "tr":
+                if self.current_row:
+                    self.table_rows.append((self.current_row, self.is_header_row))
+                self.is_header_row = False
+                self.current_row = []
+            elif tag == "table":
+                self.in_table = False
+                if self.table_rows:
+                    max_cols = max(len(r[0]) for r in self.table_rows)
+                    if max_cols > 0:
+                        tbl = doc.add_table(rows=len(self.table_rows), cols=max_cols)
+                        tbl.style = "Table Grid"
+                        for ri, (row_data, is_hdr) in enumerate(self.table_rows):
+                            for ci, cell_text in enumerate(row_data[:max_cols]):
+                                cell = tbl.rows[ri].cells[ci]
+                                cell.text = cell_text
+                                if is_hdr:
+                                    for run in cell.paragraphs[0].runs:
+                                        run.font.bold = True
+                                        run.font.color.rgb = RGBColor(0x02, 0x8a, 0x39)
+                        doc.add_paragraph()
+                self.table_rows = []
+
+        def handle_data(self, data):
+            if not self.in_skip and not self.in_table or self.current_tag in ("td","th"):
+                self.text_buf += data
+
+    builder = DocxBuilder()
+    builder.feed(html)
+
+    buf = BytesIO()
     doc.save(buf)
     buf.seek(0)
-
-    safe = re.sub(r'[^\w\s-]', '', subject)[:50].strip().replace(' ', '_')
-    return StreamingResponse(
-        buf,
+    safe_name = re.sub(r'[^\w\s-]', '', subject).strip()[:40]
+    filename = f"TaxReport_{safe_name}_{datetime.now().strftime('%Y%m%d')}.docx"
+    return Response(
+        content=buf.read(),
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={"Content-Disposition": f'attachment; filename="PhanTichThue_{safe}.docx"'},
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
     )
 
-# ── PPTX export ───────────────────────────────────────────────────────────────
-@app.post("/slides")
-async def export_pptx(request: Request, _user: str = Depends(auth)):
-    from pptx import Presentation
-    from pptx.util import Inches, Pt
-    from pptx.dml.color import RGBColor as PptxRGB
-    from pptx.enum.text import PP_ALIGN
 
-    body    = await request.json()
-    html    = body.get("html", "")
-    subject = body.get("subject", "Báo cáo")
+@app.post("/validate-subject")
+async def validate_subject(request_body: dict, user: str = Depends(check_auth)):
+    """Quick Perplexity check: does this company/sector actually exist?"""
+    subject = request_body.get("subject", "").strip()
+    mode    = request_body.get("mode", "sector")
+    if not subject:
+        raise HTTPException(400, "Missing subject")
+    if not PERPLEXITY_API_KEY:
+        return JSONResponse({"valid": True, "suggestion": ""})  # skip if no key
 
-    BRAND = PptxRGB(0x02, 0x8A, 0x39)
-    WHITE = PptxRGB(0xFF, 0xFF, 0xFF)
-    DARK  = PptxRGB(0x1E, 0x29, 0x3B)
-    LIGHT = PptxRGB(0xF8, 0xFA, 0xFC)
-
-    prs = Presentation()
-    prs.slide_width  = Inches(13.333)  # 16:9
-    prs.slide_height = Inches(7.5)
-
-    blank_layout = prs.slide_layouts[6]  # completely blank
-
-    def add_rect(slide, l, t, w, h, fill_color=None):
-        shape = slide.shapes.add_shape(1, Inches(l), Inches(t), Inches(w), Inches(h))
-        if fill_color:
-            shape.fill.solid()
-            shape.fill.fore_color.rgb = fill_color
-        else:
-            shape.fill.background()
-        shape.line.fill.background()
-        return shape
-
-    def add_text_box(slide, text, l, t, w, h, font_size=18, bold=False,
-                     color=None, align=PP_ALIGN.LEFT):
-        txBox = slide.shapes.add_textbox(Inches(l), Inches(t), Inches(w), Inches(h))
-        txBox.word_wrap = True
-        tf = txBox.text_frame
-        tf.word_wrap = True
-        p = tf.paragraphs[0]
-        p.alignment = align
-        run = p.add_run()
-        run.text = text
-        run.font.size = Pt(font_size)
-        run.font.bold = bold
-        if color:
-            run.font.color.rgb = color
-        return txBox
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Slide 1: Cover
-    slide = prs.slides.add_slide(blank_layout)
-    add_rect(slide, 0, 0, 13.333, 7.5, fill_color=BRAND)
-    add_text_box(slide, "PHÂN TÍCH THUẾ",
-                 0.8, 1.5, 11.5, 1.0,
-                 font_size=20, color=PptxRGB(0xBB, 0xF7, 0xD0), align=PP_ALIGN.CENTER)
-    add_text_box(slide, subject,
-                 0.8, 2.5, 11.5, 2.0,
-                 font_size=36, bold=True, color=WHITE, align=PP_ALIGN.CENTER)
-    add_text_box(slide, datetime.now().strftime("%d/%m/%Y"),
-                 0.8, 5.5, 11.5, 0.8,
-                 font_size=16, color=PptxRGB(0xBB, 0xF7, 0xD0), align=PP_ALIGN.CENTER)
-
-    # Content slides: one per h2
-    for h2 in soup.find_all("h2"):
-        title_text = h2.get_text(strip=True)
-        bullets = []
-        for sib in h2.find_next_siblings():
-            if sib.name == "h2":
-                break
-            if sib.name in ("p", "li"):
-                t = sib.get_text(strip=True)
-                if t and len(t) > 10:
-                    bullets.append(t[:200])
-            elif sib.name in ("ul", "ol"):
-                for li in sib.find_all("li"):
-                    t = li.get_text(strip=True)
-                    if t:
-                        bullets.append(t[:200])
-            if len(bullets) >= 7:
-                break
-
-        slide = prs.slides.add_slide(blank_layout)
-        add_rect(slide, 0, 0, 13.333, 1.4, fill_color=BRAND)
-        add_text_box(slide, title_text,
-                     0.4, 0.1, 12.5, 1.2,
-                     font_size=22, bold=True, color=WHITE, align=PP_ALIGN.LEFT)
-        add_rect(slide, 0, 1.4, 13.333, 6.1, fill_color=LIGHT)
-
-        if bullets:
-            txBox = slide.shapes.add_textbox(
-                Inches(0.5), Inches(1.7), Inches(12.3), Inches(5.5)
+    entity = "công ty" if mode == "company" else "ngành/sector kinh doanh"
+    query = (
+        f'Is "{subject}" a real, well-known {entity} in Vietnam or internationally? '
+        f'Reply in JSON only: {{"exists": true/false, "canonical_name": "correct name or empty", "note": "short explanation in Vietnamese"}}'
+    )
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        try:
+            resp = await client.post(
+                "https://api.perplexity.ai/chat/completions",
+                headers={"Authorization": f"Bearer {PERPLEXITY_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": "sonar",
+                    "max_tokens": 150,
+                    "temperature": 0.1,
+                    "messages": [
+                        {"role": "system", "content": "You are a factual validator. Reply ONLY with valid JSON, no markdown."},
+                        {"role": "user",   "content": query}
+                    ]
+                }
             )
-            txBox.word_wrap = True
-            tf = txBox.text_frame
-            tf.word_wrap = True
-            for i, bullet in enumerate(bullets[:7]):
-                p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-                p.space_before = Pt(6)
-                run = p.add_run()
-                run.text = f"▪  {bullet}"
-                run.font.size = Pt(16)
-                run.font.color.rgb = DARK
-        else:
-            add_text_box(slide, "(Xem báo cáo đầy đủ để biết chi tiết)",
-                         0.5, 2.5, 12.3, 1.0,
-                         font_size=16, color=PptxRGB(0x94, 0xA3, 0xB8))
+            resp.raise_for_status()
+            raw = resp.json()["choices"][0]["message"]["content"].strip()
+            # Strip markdown code blocks if present
+            raw = re.sub(r"^```json\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
+            data = json.loads(raw)
+            return JSONResponse({
+                "valid":      bool(data.get("exists", True)),
+                "canonical":  data.get("canonical_name", ""),
+                "note":       data.get("note", "")
+            })
+        except Exception as e:
+            # On any error, allow the search to proceed
+            return JSONResponse({"valid": True, "canonical": "", "note": str(e)})
 
-    # Last slide: Thank you
-    slide = prs.slides.add_slide(blank_layout)
-    add_rect(slide, 0, 0, 13.333, 7.5, fill_color=BRAND)
-    add_text_box(slide, "Cảm ơn",
-                 0.8, 2.5, 11.5, 1.5,
-                 font_size=40, bold=True, color=WHITE, align=PP_ALIGN.CENTER)
-    add_text_box(slide, "Báo cáo được tạo bởi Tax Sector Research AI",
-                 0.8, 4.2, 11.5, 1.0,
-                 font_size=16, color=PptxRGB(0xBB, 0xF7, 0xD0), align=PP_ALIGN.CENTER)
-
-    buf = io.BytesIO()
-    prs.save(buf)
-    buf.seek(0)
-
-    safe = re.sub(r'[^\w\s-]', '', subject)[:50].strip().replace(' ', '_')
-    return StreamingResponse(
-        buf,
-        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        headers={"Content-Disposition": f'attachment; filename="TaxSlides_{safe}.pptx"'},
-    )
-
-# ── Health ────────────────────────────────────────────────────────────────────
-@app.get("/health")
-def health(_user: str = Depends(auth)):
-    return {
-        "status": "ok",
-        "model": CLAUDE_MODEL,
-        "anthropic_configured": bool(ANTHROPIC_KEY),
-        "perplexity_configured": bool(PERPLEXITY_KEY),
-        "tvpl_scraper": "enabled",
-    }
-
-# ── Frontend ──────────────────────────────────────────────────────────────────
+# ─── Frontend ─────────────────────────────────────────────────────────────────
 HTML_PAGE = r"""<!DOCTYPE html>
-<html lang="vi" class="scroll-smooth">
+<html lang="vi">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Tax Sector Research</title>
-<link rel="icon" type="image/svg+xml" href="/favicon.svg">
-<link rel="shortcut icon" href="/favicon.svg">
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
-:root{--brand:#028a39;--brand-dk:#016d2d;--bg:#f8fafc;--surface:#fff;--border:#e2e8f0;--text:#1e293b;--muted:#64748b}
-body.dark{--bg:#0f172a;--surface:#1e293b;--border:#334155;--text:#e2e8f0;--muted:#94a3b8}
-body{background:var(--bg);color:var(--text);font-family:system-ui,sans-serif;transition:background .2s,color .2s}
+  :root{--p:#028a39;--pd:#016d2d;--pl:#e6f4ec;--pb:#a7d9b8}
+  .bg-p{background:var(--p)}.bg-pd{background:var(--pd)}.bg-pl{background:var(--pl)}
+  .text-p{color:var(--p)}.text-pd{color:var(--pd)}
+  .border-p{border-color:var(--p)}.border-pb{border-color:var(--pb)}
+  .btn-p{background:var(--p);color:#fff}.btn-p:hover{background:var(--pd)}
+  .ring-p:focus{outline:none;box-shadow:0 0 0 2px var(--pb)}
+  .chip{background:var(--pl);color:var(--p);border:1px solid var(--pb)}
+  .chip:hover{background:#d0eddc}
+  .tab-on{background:var(--p);color:#fff}
+  .tab-off{background:#f3f4f6;color:#6b7280}.tab-off:hover{background:var(--pl);color:var(--p)}
 
-/* Reading progress */
-#reading-bar{position:fixed;top:0;left:0;height:3px;background:var(--brand);width:0;z-index:1000;transition:width .1s}
+  /* Section builder */
+  .section-card{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:14px;margin-bottom:10px;transition:border-color .2s}
+  .section-card:hover{border-color:var(--pb)}
+  .section-card.dragging{opacity:.5;border:2px dashed var(--p)}
+  .sub-item{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+  .sub-item input{flex:1;font-size:.8rem;border:1px solid #e5e7eb;border-radius:6px;padding:4px 8px;color:#374151}
+  .sub-item input:focus{outline:none;border-color:var(--pb)}
 
-/* Section card */
-.sec-card{background:var(--surface);border:1px solid var(--border);border-radius:.5rem;padding:.75rem;margin-bottom:.5rem;transition:opacity .2s}
-.sec-card.off{opacity:.45}
-.sub-chip{display:inline-flex;align-items:center;gap:.2rem;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:9999px;padding:.1rem .5rem;font-size:.75rem}
-body.dark .sub-chip{background:#064e3b;border-color:#065f46}
-.sub-chip button{color:#9ca3af;cursor:pointer;line-height:1;font-size:.85rem}
-.sub-chip button:hover{color:#ef4444}
+  @media print{#app-header,#input-wrap,.no-print{display:none!important}body{background:#fff}#report-wrap{max-width:100%;margin:0;padding:0}}
+  #report-content h2{font-size:1.3rem;font-weight:700;color:var(--p);margin-top:2rem;margin-bottom:.75rem;padding-bottom:.5rem;border-bottom:2px solid var(--pb);page-break-after:avoid}
+  #report-content h3{font-size:1.1rem;font-weight:600;color:var(--pd);margin-top:1.25rem;margin-bottom:.4rem}
+  #report-content p{margin-bottom:.6rem;line-height:1.85;color:#1f2937;font-size:.975rem}
+  #report-content ul{list-style:disc;margin-left:1.5rem;margin-bottom:.75rem}
+  #report-content ul ul{list-style:circle;margin-left:1.5rem;margin-top:.3rem;margin-bottom:.3rem}
+  #report-content ul ul ul{list-style:square;margin-left:1.5rem}
+  #report-content ol{list-style:decimal;margin-left:1.5rem;margin-bottom:.75rem}
+  #report-content ol ol{list-style:lower-alpha;margin-left:1.5rem;margin-top:.3rem}
+  #report-content li{margin-bottom:.35rem;line-height:1.75;font-size:.95rem}
+  #report-content strong{color:var(--pd);font-weight:600}
+  #report-content table{width:100%;border-collapse:collapse;margin:1rem 0;font-size:.9rem}
+  #report-content th{background:var(--p);color:#fff;padding:.5rem .75rem;text-align:left}
+  #report-content td{padding:.4rem .75rem;border-bottom:1px solid #e5e7eb}
+  #report-content tr:nth-child(even) td{background:var(--pl)}
+  #report-content code{background:#f3f4f6;padding:.1rem .3rem;border-radius:3px;font-size:.85em}
+  .step-done{color:var(--p)!important}.step-active{color:#2563eb!important}
+  .dot-done{border-color:var(--p)!important;background:var(--pl)!important;color:var(--p)!important}
+  .dot-active{border-color:#2563eb!important;background:#eff6ff!important;color:#2563eb!important}
 
-/* Report content */
-#report-content h2{font-size:1.2rem;font-weight:700;color:var(--brand);margin:2rem 0 .75rem;border-bottom:2px solid var(--brand);padding-bottom:.25rem}
-#report-content h3{font-size:1rem;font-weight:600;margin:1.25rem 0 .4rem}
-#report-content p{margin:.5rem 0;line-height:1.75}
-#report-content ul,#report-content ol{padding-left:1.5rem;margin:.5rem 0}
-#report-content li{margin:.25rem 0}
-#report-content table{width:100%;border-collapse:collapse;margin:1rem 0;font-size:.875rem;display:block;overflow-x:auto}
-#report-content th{background:var(--brand);color:#fff;padding:.5rem .6rem;text-align:left}
-#report-content td{padding:.4rem .6rem;border:1px solid var(--border)}
-#report-content tr:nth-child(even) td{background:#f8fafc}
-body.dark #report-content tr:nth-child(even) td{background:#162032}
-#report-content a{color:var(--brand)}
+  /* Reading progress bar */
+  #reading-progress{position:fixed;top:0;left:0;width:0%;height:3px;background:var(--p);z-index:9999;transition:width .1s}
 
-/* Surface/border helpers */
-.surface{background:var(--surface);border:1px solid var(--border)}
-.btn{display:inline-flex;align-items:center;gap:.375rem;padding:.375rem .75rem;border-radius:.5rem;font-size:.875rem;font-weight:500;cursor:pointer;transition:background .15s}
-.btn-gray{background:#f1f5f9;color:var(--text)}
-.btn-gray:hover{background:#e2e8f0}
-.btn-green{background:#f0fdf4;border:1px solid #bbf7d0;color:#15803d}
-.btn-green:hover{background:#dcfce7}
-body.dark .btn-gray{background:#334155;color:var(--text)}
-body.dark .btn-gray:hover{background:#475569}
-body.dark .btn-green{background:#064e3b;border-color:#065f46;color:#6ee7b7}
-
-/* Fade in */
-.fade-in{animation:fi .25s ease}
-@keyframes fi{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
-
-/* Print */
-@media print{.no-print{display:none!important}#report-content{font-size:11pt}}
-
-/* Input dark */
-body.dark input,body.dark textarea,body.dark select{background:#1e293b;color:var(--text);border-color:var(--border)}
-body.dark .sec-card input[type=text]{background:transparent}
+  /* TOC sidebar */
+  #toc-sidebar{position:fixed;right:1rem;top:50%;transform:translateY(-50%);width:200px;max-height:80vh;overflow-y:auto;background:white;border:1px solid #e5e7eb;border-radius:12px;padding:12px;box-shadow:0 4px 20px rgba(0,0,0,.08);z-index:100;display:none}
+  #toc-sidebar h4{font-size:.7rem;font-weight:700;color:var(--p);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid var(--pb)}
+  .toc-item{display:block;font-size:.72rem;color:#6b7280;padding:3px 6px;border-radius:4px;cursor:pointer;line-height:1.4;text-decoration:none;transition:all .15s}
+  .toc-item:hover{background:var(--pl);color:var(--p)}
+  .toc-item.active{background:var(--pl);color:var(--p);font-weight:600}
+  .toc-progress{font-size:.65rem;color:#9ca3af;text-align:center;margin-top:8px;padding-top:6px;border-top:1px solid #f3f4f6}
+  @media(max-width:1280px){#toc-sidebar{display:none!important}}
 </style>
 </head>
-<body>
-<div id="reading-bar"></div>
+<body class="bg-gray-50 min-h-screen">
 
-<!-- ── Login Modal ──────────────────────────────────────────── -->
-<div id="login-modal" class="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
-  <div class="bg-white rounded-2xl shadow-2xl p-8 w-full max-w-sm mx-4">
-    <div class="text-center mb-6">
-      <div class="text-5xl mb-3">📊</div>
-      <h1 class="text-2xl font-bold text-gray-800">Tax Research</h1>
-      <p class="text-gray-400 text-sm mt-1">Phân tích thuế AI — Việt Nam</p>
+<!-- Reading progress bar -->
+<div id="reading-progress"></div>
+
+<!-- TOC Sidebar -->
+<div id="toc-sidebar">
+  <h4>📋 Mục lục</h4>
+  <div id="toc-items"></div>
+  <div class="toc-progress"><span id="toc-pct">0</span>% đã đọc</div>
+</div>
+
+<div id="app-header" class="bg-p text-white py-4 px-4 shadow-md no-print">
+  <div class="max-w-5xl mx-auto flex items-center justify-between">
+    <div>
+      <h1 class="text-lg font-bold">🔍 Tax Sector Research</h1>
+      <p class="text-green-200 text-xs mt-0.5">Phân tích thuế chuyên sâu · Perplexity + Claude AI</p>
     </div>
-    <div class="space-y-3">
-      <input id="li-user" type="text" placeholder="Tên đăng nhập" value="hoang"
-        class="w-full border rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-green-400 text-gray-800">
-      <input id="li-pass" type="password" placeholder="Mật khẩu"
-        class="w-full border rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-green-400 text-gray-800"
-        onkeydown="if(event.key==='Enter')doLogin()">
-      <button onclick="doLogin()"
-        class="w-full bg-green-600 hover:bg-green-700 text-white font-semibold py-2.5 rounded-lg transition">
-        Đăng nhập
+    <button onclick="showReports()" class="text-xs bg-white/20 hover:bg-white/30 px-3 py-1.5 rounded-lg font-medium">📂 Báo cáo đã lưu</button>
+  </div>
+</div>
+
+<div id="input-wrap" class="max-w-5xl mx-auto mt-6 px-4 no-print">
+  <div class="bg-white rounded-2xl shadow-sm p-6 border border-gray-200">
+
+    <!-- Mode tabs -->
+    <div class="flex gap-2 mb-5">
+      <button id="tab-sector"  onclick="setMode('sector')"  class="tab-on  text-sm px-4 py-2 rounded-lg font-semibold transition-colors">🏭 Phân tích ngành</button>
+      <button id="tab-company" onclick="setMode('company')" class="tab-off text-sm px-4 py-2 rounded-lg font-semibold transition-colors">🏢 Phân tích công ty</button>
+    </div>
+
+    <!-- Subject input -->
+    <div id="subject-sector">
+      <label class="block text-xs font-semibold text-gray-600 mb-1.5">Ngành / Sector</label>
+      <input id="sector-input" type="text" placeholder="VD: FMCG, Bất động sản, Ngân hàng, Dược phẩm..."
+        class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm ring-p focus:border-transparent">
+      <div class="flex flex-wrap gap-1.5 mt-2 items-center">
+        <span class="text-xs text-gray-400">Thử:</span>
+        <button onclick="qs('FMCG')"               class="chip text-xs px-2.5 py-0.5 rounded-full">FMCG</button>
+        <button onclick="qs('Bất động sản')"        class="chip text-xs px-2.5 py-0.5 rounded-full">Bất động sản</button>
+        <button onclick="qs('Ngân hàng')"           class="chip text-xs px-2.5 py-0.5 rounded-full">Ngân hàng</button>
+        <button onclick="qs('Sản xuất ô tô')"       class="chip text-xs px-2.5 py-0.5 rounded-full">Sản xuất ô tô</button>
+        <button onclick="qs('Dược phẩm')"           class="chip text-xs px-2.5 py-0.5 rounded-full">Dược phẩm</button>
+        <button onclick="qs('Logistics')"           class="chip text-xs px-2.5 py-0.5 rounded-full">Logistics</button>
+        <button onclick="qs('Công nghệ thông tin')" class="chip text-xs px-2.5 py-0.5 rounded-full">CNTT</button>
+        <button onclick="qs('Năng lượng tái tạo')"  class="chip text-xs px-2.5 py-0.5 rounded-full">Năng lượng TT</button>
+      </div>
+    </div>
+    <div id="subject-company" class="hidden grid grid-cols-2 gap-3">
+      <div>
+        <label class="block text-xs font-semibold text-gray-600 mb-1.5">Tên công ty</label>
+        <input id="company-input" type="text" placeholder="VD: Vinamilk, Masan, Samsung Vietnam..."
+          class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm ring-p">
+      </div>
+      <div>
+        <label class="block text-xs font-semibold text-gray-600 mb-1.5">Ngành chính</label>
+        <input id="sector-company-input" type="text" placeholder="VD: FMCG, Sản xuất điện tử..."
+          class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm ring-p">
+      </div>
+    </div>
+
+    <!-- Section Builder -->
+    <div class="mt-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-sm font-bold text-gray-700">📋 Nội dung báo cáo <span id="section-count" class="text-xs font-normal text-gray-400"></span></h3>
+        <div class="flex gap-2">
+          <button onclick="resetSections()" class="text-xs text-gray-500 hover:text-p px-2 py-1 rounded border border-gray-200 hover:border-p transition-colors">↺ Mặc định</button>
+          <button onclick="addSection()"    class="text-xs btn-p px-3 py-1 rounded-lg font-medium transition-colors">+ Thêm phần</button>
+        </div>
+      </div>
+      <p class="text-xs text-gray-400 mb-3">Kéo thả để sắp xếp · Click tiêu đề để chỉnh sửa · Xoá phần không cần · Thêm sub-items chi tiết</p>
+      <div id="sections-container"></div>
+    </div>
+
+    <!-- Cost estimate + Run button -->
+    <div class="mt-5 flex items-center justify-between">
+      <div class="text-xs text-gray-400">
+        ⏱ ~<span id="est-time">90</span>s · 💰 ~$<span id="est-cost">0.08</span> (Perplexity + Claude)
+      </div>
+      <button onclick="startResearch()" class="btn-p px-8 py-3 rounded-xl font-bold text-sm shadow-sm transition-colors">
+        Nghiên cứu →
       </button>
-      <p id="li-err" class="text-red-500 text-sm text-center hidden">Sai tên đăng nhập hoặc mật khẩu</p>
     </div>
   </div>
 </div>
 
-<!-- ── App Shell ─────────────────────────────────────────────── -->
-<div id="app" class="max-w-4xl mx-auto px-4 py-5">
-
-  <!-- Header -->
-  <header class="flex items-center justify-between mb-5">
-    <div class="flex items-center gap-3 cursor-pointer" onclick="newReport()">
-      <span class="text-3xl">📊</span>
-      <div>
-        <h1 class="text-lg font-bold">Tax Sector Research</h1>
-        <p class="text-xs" style="color:var(--muted)">Phân tích thuế AI — Việt Nam</p>
-      </div>
+<!-- Progress -->
+<div id="progress-wrap" class="max-w-5xl mx-auto mt-5 px-4 hidden no-print">
+  <div class="bg-white rounded-2xl shadow-sm p-5 border border-gray-200">
+    <div id="status-text" class="text-sm font-semibold mb-3 text-p"></div>
+    <div class="w-full bg-gray-100 rounded-full h-2 mb-4">
+      <div id="progress-bar" class="h-2 rounded-full transition-all duration-500 bg-p" style="width:0%"></div>
     </div>
-    <button onclick="toggleDark()" id="dark-btn" class="text-xl p-2 rounded-lg btn-gray">☀️</button>
-  </header>
-
-  <!-- ── SETUP PHASE ─────────────────────────────────────────── -->
-  <div id="ph-setup">
-    <!-- Tabs -->
-    <div class="flex gap-2 mb-4">
-      <button id="tab-sector" onclick="setMode('sector')"
-        class="px-5 py-2 rounded-full text-sm font-medium transition bg-green-600 text-white">
-        🏭 Ngành / Lĩnh vực
-      </button>
-      <button id="tab-company" onclick="setMode('company')"
-        class="px-5 py-2 rounded-full text-sm font-medium transition bg-gray-100 text-gray-600 hover:bg-gray-200">
-        🏢 Doanh nghiệp
-      </button>
-    </div>
-
-    <!-- Subject input -->
-    <div class="surface rounded-xl p-5 mb-4 shadow-sm">
-      <label id="subj-label" class="block text-sm font-medium mb-2">Tên ngành / lĩnh vực:</label>
-      <input id="subj-input" type="text"
-        placeholder="VD: Bất động sản, Fintech, Sản xuất thép, Thương mại điện tử..."
-        class="w-full border border-gray-200 rounded-lg px-4 py-3 text-lg focus:outline-none focus:ring-2 focus:ring-green-400"
-        onkeydown="if(event.key==='Enter')startResearch()">
-      <div class="flex items-center gap-5 mt-3">
-        <span class="text-sm" style="color:var(--muted)">Research model:</span>
-        <label class="flex items-center gap-1.5 cursor-pointer text-sm">
-          <input type="radio" name="sonar" value="sonar" checked class="accent-green-600"> Sonar (nhanh)
-        </label>
-        <label class="flex items-center gap-1.5 cursor-pointer text-sm">
-          <input type="radio" name="sonar" value="sonar-pro" class="accent-green-600"> Sonar Pro (sâu)
-        </label>
-      </div>
-      <div class="mt-3 flex items-center gap-3">
-        <button id="btn-recommend" onclick="aiRecommend()"
-          class="btn btn-green text-sm">
-          ✨ AI Gợi ý cấu trúc cho chủ đề này
-        </button>
-        <span id="recommend-hint" class="text-xs" style="color:var(--muted)">
-          Nhập tên ngành/công ty rồi bấm để AI đề xuất sections phù hợp
-        </span>
-      </div>
-    </div>
-
-    <!-- Section editor -->
-    <div class="surface rounded-xl p-5 mb-4 shadow-sm">
-      <div class="flex items-center justify-between mb-3">
-        <h2 class="font-semibold text-sm uppercase tracking-wide" style="color:var(--muted)">Cấu trúc báo cáo</h2>
-        <div class="flex gap-2">
-          <button onclick="resetSections()" class="btn btn-gray text-xs">↩ Đặt lại</button>
-          <button onclick="addSection()" class="btn btn-green text-xs">+ Thêm phần</button>
-        </div>
-      </div>
-      <div id="sections-list"></div>
-    </div>
-
-    <!-- Submit -->
-    <button onclick="startResearch()"
-      class="w-full bg-green-600 hover:bg-green-700 active:bg-green-800 text-white font-bold
-             py-4 rounded-xl text-lg shadow-md transition">
-      🔍 Bắt đầu phân tích
-    </button>
-    <p class="text-center text-xs mt-2" style="color:var(--muted)">Ước tính 2–5 phút tuỳ số lượng phần</p>
+    <div id="steps-container" class="grid grid-cols-2 gap-1.5"></div>
   </div>
+</div>
 
-  <!-- ── PROGRESS PHASE ──────────────────────────────────────── -->
-  <div id="ph-progress" class="hidden">
-    <div class="surface rounded-xl p-5 mb-4 shadow-sm">
-      <div class="flex items-center gap-3 mb-4">
-        <div class="animate-spin text-2xl select-none">⚙️</div>
-        <div class="flex-1">
-          <p id="prog-status" class="font-medium">Đang khởi động...</p>
-          <p id="prog-subject" class="text-sm" style="color:var(--muted)"></p>
-        </div>
-        <button onclick="cancelResearch()" class="btn btn-gray text-xs text-red-500">✕ Huỷ</button>
-      </div>
-      <div class="h-2 bg-gray-100 rounded-full overflow-hidden">
-        <div id="prog-bar" class="h-full bg-green-500 transition-all duration-500 rounded-full" style="width:0%"></div>
-      </div>
-      <div class="flex justify-between text-xs mt-1" style="color:var(--muted)">
-        <span id="prog-label">Bắt đầu...</span>
-        <span id="prog-pct">0%</span>
-      </div>
+<!-- Report -->
+<div id="report-wrap" class="max-w-5xl mx-auto mt-5 px-4 mb-16 hidden">
+  <div class="bg-p text-white p-6 rounded-t-2xl">
+    <div class="text-xs opacity-70 font-semibold tracking-widest mb-2">TAX RESEARCH REPORT</div>
+    <h1 id="report-title" class="text-xl font-bold"></h1>
+    <div class="text-green-200 text-xs mt-2"><span id="report-date"></span> · Perplexity + Claude AI</div>
+  </div>
+  <div class="bg-gray-100 border-x border-gray-200 px-5 py-2.5 flex flex-wrap gap-2 items-center no-print">
+    <button onclick="window.print()"  class="text-xs bg-white border border-gray-300 hover:bg-gray-50 px-3 py-1.5 rounded-lg text-gray-700 font-medium">🖨️ In/PDF</button>
+    <button onclick="copyReport()"    class="text-xs bg-white border border-gray-300 hover:bg-gray-50 px-3 py-1.5 rounded-lg text-gray-700 font-medium">📋 Copy</button>
+    <button onclick="openDashboard()" class="text-xs bg-white border border-gray-300 hover:bg-gray-50 px-3 py-1.5 rounded-lg text-gray-700 font-medium">📊 Dashboard</button>
+    <button id="btn-appendix" onclick="openAppendix()" class="px-4 py-2 bg-purple-600 text-white rounded hover:bg-purple-700 text-sm disabled:opacity-50">📋 Appendix</button>
+        <button id="btn-slides" class="text-xs bg-white border border-gray-300 hover:bg-gray-50 px-3 py-1.5 rounded-lg text-gray-700 font-medium">📑 Slides</button>
+    <button onclick="exportDocx()"    id="btn-docx"   class="text-xs bg-white border border-gray-300 hover:bg-gray-50 px-3 py-1.5 rounded-lg text-gray-700 font-medium">📄 Word</button>
+    <button onclick="showReports()"   class="text-xs bg-white border border-gray-300 hover:bg-gray-50 px-3 py-1.5 rounded-lg text-gray-700 font-medium">📂 Xem lại</button>
+    <button onclick="resetForm()"     class="text-xs bg-white border border-gray-300 hover:bg-gray-50 px-3 py-1.5 rounded-lg text-gray-700 font-medium">← Mới</button>
+    <div class="flex items-center gap-1 no-print" title="Cỡ chữ">
+      <button onclick="changeFontSize(-1)" class="text-xs bg-white border border-gray-300 hover:bg-gray-50 w-7 h-7 rounded-lg text-gray-700 font-bold leading-none">A-</button>
+      <button onclick="changeFontSize(1)"  class="text-xs bg-white border border-gray-300 hover:bg-gray-50 w-7 h-7 rounded-lg text-gray-700 font-bold leading-none">A+</button>
     </div>
-    <div id="step-list" class="space-y-2 mb-4"></div>
-    <div id="partial-wrap" class="surface rounded-xl p-5 hidden">
-      <p class="font-medium text-green-700 mb-3 text-sm">📝 Đang tạo báo cáo...</p>
-      <div id="partial-body" class="text-sm overflow-y-auto max-h-80"></div>
+    <span id="sources-count" class="ml-auto text-xs text-gray-400"></span>
+  </div>
+  <div class="bg-white shadow-sm rounded-b-2xl border border-gray-200 px-8 py-8">
+    <div id="report-content" class="text-gray-800 text-base leading-relaxed"></div>
+    <div id="sources-section" class="hidden mt-8 pt-5 border-t-2 border-pb">
+      <h3 class="text-sm font-bold text-gray-700 mb-3">📚 Nguồn tham khảo</h3>
+      <div id="sources-list" class="text-xs text-gray-500 space-y-1"></div>
+    </div>
+    <div id="disclaimer" class="hidden mt-5 text-xs text-gray-400 italic bg-gray-50 p-3 rounded-lg border border-gray-100">
+      <strong>Lưu ý:</strong> Báo cáo tổng hợp tự động bởi AI, mang tính tham khảo. Ngày tạo: <span id="gen-date"></span>
     </div>
   </div>
+</div>
 
-  <!-- ── REPORT PHASE ────────────────────────────────────────── -->
-  <div id="ph-report" class="hidden">
-    <!-- Toolbar -->
-    <div class="no-print flex flex-wrap items-center gap-2 mb-4 surface rounded-xl p-3 shadow-sm sticky top-2 z-40">
-      <button onclick="window.print()" class="btn btn-gray">🖨️ In/PDF</button>
-      <button id="btn-slides" onclick="doSlides()" class="btn btn-gray">📑 Slides PPTX</button>
-      <button id="btn-docx" onclick="doDocx()" class="btn btn-gray">📄 Word</button>
-      <button onclick="openReports()" class="btn btn-gray">📂 Báo cáo đã lưu</button>
-      <div class="flex-1"></div>
-      <button onclick="chgFont(-1)" class="btn btn-gray font-bold">A−</button>
-      <button onclick="chgFont(1)"  class="btn btn-gray font-bold">A+</button>
-      <button onclick="toggleDark()" id="dark-btn2" class="btn btn-gray">☀️</button>
-      <button onclick="newReport()" class="btn btn-green">+ Mới</button>
-    </div>
-
-    <!-- Report card -->
-    <div class="surface rounded-xl shadow-sm overflow-hidden">
-      <!-- Header band -->
-      <div class="bg-green-700 text-white px-6 py-5">
-        <p class="text-green-300 text-xs uppercase tracking-widest font-medium">Báo cáo phân tích thuế</p>
-        <h1 id="rpt-title" class="text-xl font-bold mt-1">—</h1>
-        <p id="rpt-meta" class="text-green-300 text-xs mt-1"></p>
-      </div>
-      <!-- TOC -->
-      <div id="toc-wrap" class="border-b px-6 py-3 bg-gray-50 hidden" style="background:var(--bg)">
-        <p class="text-xs font-semibold uppercase tracking-wide mb-2" style="color:var(--muted)">Mục lục</p>
-        <div id="toc-list" class="space-y-0.5"></div>
-      </div>
-      <!-- Content -->
-      <div id="report-content" class="px-8 py-6" style="font-size:16px"></div>
-      <!-- Sources -->
-      <div id="src-wrap" class="border-t px-6 py-4 hidden" style="background:var(--bg)">
-        <button onclick="toggleSrc()" class="text-sm font-semibold flex items-center gap-2" style="color:var(--muted)">
-          <span id="src-arrow">▶</span> Nguồn tham khảo (<span id="src-count">0</span>)
-        </button>
-        <div id="src-list" class="hidden mt-2 space-y-1"></div>
-      </div>
-    </div>
-  </div>
-</div><!-- /app -->
-
-<!-- ── Reports Modal ─────────────────────────────────────────── -->
-<div id="modal-reports" class="fixed inset-0 bg-black/50 z-50 hidden flex items-center justify-center">
-  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-xl mx-4 max-h-[80vh] flex flex-col"
-       style="background:var(--surface);color:var(--text)">
-    <div class="p-5 border-b flex items-center justify-between" style="border-color:var(--border)">
+<!-- Reports modal -->
+<div id="reports-modal" class="hidden fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4 no-print">
+  <div class="bg-white rounded-2xl shadow-xl w-full max-w-lg max-h-[80vh] overflow-hidden flex flex-col">
+    <div class="bg-p text-white px-5 py-4 flex items-center justify-between">
       <h2 class="font-bold">📂 Báo cáo đã lưu</h2>
-      <button onclick="closeModal('modal-reports')" class="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
+      <button onclick="closeReports()" class="text-green-200 hover:text-white text-xl leading-none">×</button>
     </div>
     <div id="reports-list" class="flex-1 overflow-y-auto p-4 space-y-2"></div>
   </div>
 </div>
 
-
 <script>
-// ── State ─────────────────────────────────────────────────────
-let AUTH = '';
+// ── State ────────────────────────────────────────────────────────────────────
 let mode = 'sector';
+// ── Auth helper — same-origin credentials ────────────────────────────────────
+const AUTH_CREDS = btoa('hoang:taxsector2026');
+function apiFetch(url, opts={}) {
+  // Use credentials:'include' for same-origin Basic Auth
+  opts.credentials = 'include';
+  // Also set Authorization header as fallback
+  if(!opts.headers) opts.headers = {};
+  opts.headers['Authorization'] = 'Basic ' + AUTH_CREDS;
+  return fetch(url, opts);
+}
 let sections = [];
-let reportHtml = '';
-let citations = [];
-let currentFile = null;
-let fontSize = 16;
-let dark = false;
-let abortCtrl = null;
+let isDone = false;
+let dragSrc = null;
 
-// ── Auth ──────────────────────────────────────────────────────
-async function doLogin() {
-  const u = document.getElementById('li-user').value.trim();
-  const p = document.getElementById('li-pass').value.trim();
-  AUTH = 'Basic ' + btoa(u + ':' + p);
-  try {
-    const r = await fetch('/health', {headers: {Authorization: AUTH}});
-    if (r.ok) {
-      document.getElementById('login-modal').classList.add('hidden');
-      init();
-    } else {
-      document.getElementById('li-err').classList.remove('hidden');
-      AUTH = '';
-    }
-  } catch(e) {
-    document.getElementById('li-err').classList.remove('hidden');
-    AUTH = '';
-  }
-}
-
-// ── Init ──────────────────────────────────────────────────────
-async function init() {
-  await loadSections();
-}
-
-// ── Mode ──────────────────────────────────────────────────────
+// ── Mode switch ───────────────────────────────────────────────────────────────
 function setMode(m) {
   mode = m;
-  const on  = 'px-5 py-2 rounded-full text-sm font-medium transition bg-green-600 text-white';
-  const off = 'px-5 py-2 rounded-full text-sm font-medium transition bg-gray-100 text-gray-600 hover:bg-gray-200';
-  document.getElementById('tab-sector').className  = m === 'sector'  ? on : off;
-  document.getElementById('tab-company').className = m === 'company' ? on : off;
-  document.getElementById('subj-label').textContent = m === 'sector'
-    ? 'Tên ngành / lĩnh vực cần phân tích:' : 'Tên công ty cần phân tích:';
-  document.getElementById('subj-input').placeholder = m === 'sector'
-    ? 'VD: Bất động sản, Fintech, Sản xuất thép...' : 'VD: Vinamilk, FPT, Masan Group...';
-  loadSections();
+  document.getElementById('subject-sector').classList.toggle('hidden', m!=='sector');
+  document.getElementById('subject-company').classList.toggle('hidden', m!=='company');
+  document.getElementById('tab-sector').className  = (m==='sector'  ? 'tab-on' : 'tab-off') + ' text-sm px-4 py-2 rounded-lg font-semibold transition-colors';
+  document.getElementById('tab-company').className = (m==='company' ? 'tab-on' : 'tab-off') + ' text-sm px-4 py-2 rounded-lg font-semibold transition-colors';
+  loadDefaultSections();
 }
+function qs(s){ document.getElementById('sector-input').value=s; }
 
-// ── Sections ──────────────────────────────────────────────────
-async function loadSections() {
-  const r = await fetch('/default-sections?mode=' + mode, {headers: {Authorization: AUTH}});
+// ── Load default sections from server ─────────────────────────────────────────
+async function loadDefaultSections() {
+  const r = await apiFetch(`/default-sections?mode=${mode}`);
   sections = await r.json();
   renderSections();
 }
 
-function resetSections() { loadSections(); }
+function resetSections(){ loadDefaultSections(); }
 
+// ── Section rendering ─────────────────────────────────────────────────────────
 function renderSections() {
-  const el = document.getElementById('sections-list');
-  el.innerHTML = '';
-  sections.forEach((s, i) => el.appendChild(makeCard(s, i)));
+  const container = document.getElementById('sections-container');
+  container.innerHTML = '';
+  sections.forEach((sec, idx) => {
+    const card = document.createElement('div');
+    card.className = 'section-card';
+    card.draggable = true;
+    card.dataset.idx = idx;
+    card.innerHTML = `
+      <div class="flex items-start gap-2">
+        <div class="cursor-grab text-gray-300 hover:text-gray-500 mt-1 select-none" title="Kéo để sắp xếp">⠿</div>
+        <div class="flex-1">
+          <div class="flex items-center gap-2 mb-2">
+            <span class="text-xs font-bold text-p bg-pl px-2 py-0.5 rounded">${idx+1}</span>
+            <input type="text" value="${escHtml(sec.title)}" onchange="updateTitle(${idx},this.value)"
+              class="flex-1 text-sm font-semibold text-gray-800 border-0 bg-transparent focus:outline-none focus:bg-gray-50 focus:px-2 rounded">
+          </div>
+          <div id="subs-${idx}" class="ml-5 space-y-1">
+            ${(sec.sub||[]).map((s,si)=>subItemHtml(idx,si,s)).join('')}
+          </div>
+          <button onclick="addSub(${idx})" class="ml-5 mt-1 text-xs text-p hover:text-pd flex items-center gap-1">
+            <span class="text-base leading-none">+</span> Thêm sub-item
+          </button>
+        </div>
+        <button onclick="removeSection(${idx})" class="text-gray-300 hover:text-red-400 text-lg leading-none mt-0.5" title="Xoá phần này">×</button>
+      </div>`;
+    // Drag events
+    card.addEventListener('dragstart', e => { dragSrc=idx; card.classList.add('dragging'); e.dataTransfer.effectAllowed='move'; });
+    card.addEventListener('dragend',   ()  => card.classList.remove('dragging'));
+    card.addEventListener('dragover',  e   => { e.preventDefault(); e.dataTransfer.dropEffect='move'; });
+    card.addEventListener('drop',      e   => { e.preventDefault(); if(dragSrc!==null && dragSrc!==idx){ moveSec(dragSrc,idx); } });
+    container.appendChild(card);
+  });
+  updateEstimates();
+  document.getElementById('section-count').textContent = `(${sections.length} phần)`;
 }
 
-function esc(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+function subItemHtml(idx, si, val) {
+  return `<div class="sub-item" id="sub-${idx}-${si}">
+    <span class="text-gray-300 text-xs select-none">•</span>
+    <input type="text" value="${escHtml(val)}" onchange="updateSub(${idx},${si},this.value)" placeholder="Mô tả nội dung cần phân tích...">
+    <button onclick="removeSub(${idx},${si})" class="text-gray-300 hover:text-red-400 text-sm leading-none flex-shrink-0">×</button>
+  </div>`;
 }
 
-function makeCard(sec, i) {
-  const div = document.createElement('div');
-  div.className = 'sec-card' + (sec.enabled ? '' : ' off');
-  div.dataset.id = sec.id;
+function escHtml(s){ return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
-  const chips = sec.sub.map((s, j) => `<span class="sub-chip">${esc(s)}<button onclick="rmSub('${sec.id}',${j})">✕</button></span>`).join('');
+// ── Section mutations ──────────────────────────────────────────────────────────
+function updateTitle(idx, val){ sections[idx].title = val; updateEstimates(); }
+function updateSub(idx, si, val){ sections[idx].sub[si] = val; }
+function removeSub(idx, si){ sections[idx].sub.splice(si,1); renderSections(); }
+function addSub(idx){ sections[idx].sub = sections[idx].sub||[]; sections[idx].sub.push(''); renderSections(); setTimeout(()=>{ const subs=document.querySelectorAll(`#subs-${idx} input`); if(subs.length) subs[subs.length-1].focus(); },50); }
+function removeSection(idx){ sections.splice(idx,1); renderSections(); }
+function addSection(){ sections.push({id:'custom_'+Date.now(), title:'Nội dung mới', sub:['']}); renderSections(); setTimeout(()=>{ const cards=document.querySelectorAll('.section-card'); const last=cards[cards.length-1]; if(last){ last.querySelector('input[type=text]').focus(); last.scrollIntoView({behavior:'smooth',block:'nearest'}); } },50); }
+function moveSec(from, to){ const item=sections.splice(from,1)[0]; sections.splice(to,0,item); dragSrc=null; renderSections(); }
 
-  div.innerHTML = `
-    <div class="flex items-center gap-2 mb-2">
-      <input type="checkbox" ${sec.enabled ? 'checked' : ''} class="accent-green-600 w-4 h-4 cursor-pointer"
-        onchange="togSec('${sec.id}',this.checked)">
-      <input type="text" value="${esc(sec.title)}"
-        class="flex-1 font-medium text-sm border-0 focus:outline-none focus:ring-1 focus:ring-green-300 rounded px-1"
-        style="background:transparent"
-        onblur="updTitle('${sec.id}',this.value)">
-      <button onclick="suggestSubs('${sec.id}')" class="text-xs px-2 py-0.5 rounded border border-gray-200 hover:bg-gray-50" style="color:var(--muted)" title="AI gợi ý chủ đề con">✨</button>
-      <button onclick="rmSec('${sec.id}')" class="text-gray-300 hover:text-red-400 text-sm px-1">✕</button>
-    </div>
-    <div class="flex flex-wrap gap-1 ml-6">
-      ${chips}
-      <button onclick="addSub('${sec.id}')"
-        class="text-xs px-2 py-0.5 rounded-full border border-dashed border-gray-300 hover:border-green-400 hover:text-green-600 transition"
-        style="color:var(--muted)">+ thêm</button>
+function updateEstimates(){
+  const n = sections.length;
+  // Legal sections (~60% of default sections) generate 2 queries each
+  const LEGAL_KW = ['quy định','pháp lý','luật','thuế','công văn','tranh chấp','hóa đơn','hoá đơn','chuyển giá','giao dịch'];
+  const legalCount = sections.filter(s => LEGAL_KW.some(kw => s.title.toLowerCase().includes(kw))).length;
+  const totalQueries = n + legalCount; // extra query per legal section
+  document.getElementById('est-time').textContent = Math.round(totalQueries * 15 + 30);
+  document.getElementById('est-cost').textContent = (totalQueries * 0.008 + 0.04).toFixed(2);
+}
+
+// ── Research ──────────────────────────────────────────────────────────────────
+function getSubject(){
+  if(mode==='sector'){
+    return document.getElementById('sector-input').value.trim();
+  } else {
+    const co = document.getElementById('company-input').value.trim();
+    const sec = document.getElementById('sector-company-input').value.trim();
+    return co && sec ? `${co} (ngành ${sec})` : (co || sec);
+  }
+}
+
+function startResearch(){
+  const subject = getSubject();
+  if(!subject){ alert('Vui lòng nhập ngành hoặc tên công ty.'); return; }
+  if(!sections.length){ alert('Vui lòng thêm ít nhất 1 phần báo cáo.'); return; }
+
+  // Sync current input values to sections array
+  document.querySelectorAll('.section-card').forEach((card, idx) => {
+    const titleEl = card.querySelector('div.flex input[type=text]');
+    if(titleEl) sections[idx].title = titleEl.value;
+    const subEls = card.querySelectorAll('.sub-item input');
+    sections[idx].sub = Array.from(subEls).map(el=>el.value).filter(v=>v.trim());
+  });
+
+  isDone = false;
+  document.getElementById('progress-wrap').classList.remove('hidden');
+  document.getElementById('report-wrap').classList.add('hidden');
+  document.getElementById('report-content').innerHTML = '';
+  document.getElementById('sources-section').classList.add('hidden');
+  document.getElementById('disclaimer').classList.add('hidden');
+  document.getElementById('progress-bar').style.width = '0%';
+  document.getElementById('status-text').textContent = 'Đang khởi động...';
+
+  // Build dynamic step indicators
+  const stepsEl = document.getElementById('steps-container');
+  stepsEl.innerHTML = sections.map((sec,i) =>
+    `<div id="step-${i+1}" class="flex items-center gap-2 text-xs text-gray-400 p-2 rounded-lg">
+      <div class="step-dot w-5 h-5 rounded-full border-2 border-gray-300 flex-shrink-0 flex items-center justify-center text-xs font-bold">${i+1}</div>
+      <span class="truncate">${escHtml(sec.title)}</span>
+    </div>`
+  ).join('') +
+    `<div id="step-ai" class="flex items-center gap-2 text-xs text-gray-400 p-2 rounded-lg col-span-2">
+      <div class="step-dot w-5 h-5 rounded-full border-2 border-gray-300 flex-shrink-0 flex items-center justify-center text-xs font-bold">AI</div>
+      <span>Tổng hợp với Claude AI</span>
     </div>`;
-  return div;
+
+  document.getElementById('report-title').textContent = `Phân Tích Thuế — ${subject}`;
+  document.getElementById('report-date').textContent = new Date().toLocaleDateString('vi-VN',{year:'numeric',month:'long',day:'numeric'});
+
+  const body = JSON.stringify({mode, subject, sections: sections.map(s=>({id:s.id,title:s.title,sub:s.sub||[]}))});
+  startSSE(subject, body);
 }
 
-function togSec(id, enabled) {
-  const s = sections.find(x => x.id === id);
-  if (s) {
-    s.enabled = enabled;
-    const card = document.querySelector(`[data-id="${id}"]`);
-    if (card) card.className = 'sec-card' + (enabled ? '' : ' off');
-  }
-}
 
-function updTitle(id, t) {
-  const s = sections.find(x => x.id === id);
-  if (s) s.title = t;
-}
+async function startSSE(subject, body) {
+  let reportHtml = '';
+  const MAX_RETRIES = 3;
+  let attempt = 0;
 
-function rmSec(id) {
-  sections = sections.filter(s => s.id !== id);
-  renderSections();
-}
-
-function addSection() {
-  const id = 's' + Date.now();
-  sections.push({id, title: 'Phần mới', sub: [], enabled: true});
-  renderSections();
-  setTimeout(() => {
-    const inp = document.querySelector(`[data-id="${id}"] input[type="text"]`);
-    if (inp) { inp.focus(); inp.select(); }
-  }, 50);
-}
-
-function rmSub(secId, idx) {
-  const s = sections.find(x => x.id === secId);
-  if (s) { s.sub.splice(idx, 1); renderSections(); }
-}
-
-function addSub(secId) {
-  const name = prompt('Nhập tên chủ đề con:');
-  if (name && name.trim()) {
-    const s = sections.find(x => x.id === secId);
-    if (s) { s.sub.push(name.trim()); renderSections(); }
-  }
-}
-
-async function suggestSubs(secId) {
-  const s = sections.find(x => x.id === secId);
-  if (!s) return;
-  const subject = document.getElementById('subj-input').value.trim() || '(chưa nhập)';
-  const r = await fetch('/suggest-subsections', {
-    method: 'POST',
-    headers: {Authorization: AUTH, 'Content-Type': 'application/json'},
-    body: JSON.stringify({title: s.title, subject})
-  });
-  const {suggestions} = await r.json();
-  if (suggestions && suggestions.length) {
-    suggestions.forEach(sg => { if (!s.sub.includes(sg)) s.sub.push(sg); });
-    renderSections();
-  }
-}
-
-// ── Research ──────────────────────────────────────────────────
-async function aiRecommend() {
-  const subject = document.getElementById('subj-input').value.trim();
-  if (!subject) {
-    alert('Vui lòng nhập tên ngành hoặc công ty trước');
-    return;
-  }
-  const btn = document.getElementById('btn-recommend');
-  const hint = document.getElementById('recommend-hint');
-  btn.textContent = '⏳ AI đang phân tích...';
-  btn.disabled = true;
-  hint.textContent = 'Đang gợi ý sections phù hợp với ' + subject + '...';
-
-  try {
-    const r = await fetch('/recommend-sections', {
-      method: 'POST',
-      headers: {Authorization: AUTH, 'Content-Type': 'application/json'},
-      body: JSON.stringify({subject, mode}),
+  async function doStream() {
+    const resp = await fetch('/stream', {
+      method:'POST',
+      credentials: 'include',
+      headers:{'Content-Type':'application/json', 'Authorization':'Basic '+AUTH_CREDS},
+      body
     });
-    if (r.ok) {
-      const data = await r.json();
-      if (data.sections && data.sections.length) {
-        sections = data.sections;
-        renderSections();
-        hint.textContent = data.ai_recommended
-          ? `✅ AI đã đề xuất ${data.sections.length} sections tối ưu cho "${subject}"`
-          : '⚠️ Dùng sections mặc định (AI không khả dụng)';
-      }
-    } else {
-      hint.textContent = 'Không thể lấy gợi ý — dùng sections mặc định';
-    }
-  } catch(e) {
-    hint.textContent = 'Lỗi: ' + e.message;
-  } finally {
-    btn.textContent = '✨ AI Gợi ý cấu trúc cho chủ đề này';
-    btn.disabled = false;
-  }
-}
-
-async function startResearch() {
-  const subject = document.getElementById('subj-input').value.trim();
-  if (!subject) { alert('Vui lòng nhập tên ngành hoặc công ty'); return; }
-  const enabled = sections.filter(s => s.enabled);
-  if (!enabled.length) { alert('Vui lòng bật ít nhất một phần'); return; }
-
-  const sonar = document.querySelector('input[name="sonar"]:checked').value;
-  showPhase('progress');
-  document.getElementById('prog-subject').textContent = subject;
-  reportHtml = '';
-  citations = [];
-  currentFile = null;
-  document.getElementById('step-list').innerHTML = '';
-  document.getElementById('partial-body').innerHTML = '';
-  document.getElementById('partial-wrap').classList.add('hidden');
-
-  abortCtrl = new AbortController();
-
-  try {
-    const res = await fetch('/stream', {
-      method: 'POST',
-      headers: {Authorization: AUTH, 'Content-Type': 'application/json'},
-      body: JSON.stringify({subject, mode, sections, sonar_model: sonar}),
-      signal: abortCtrl.signal,
-    });
-
-    if (!res.ok) { showErr('Lỗi server: ' + res.status); return; }
-
-    const reader = res.body.getReader();
-    const dec = new TextDecoder();
+    if(!resp.ok) throw new Error('HTTP ' + resp.status);
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
     let buf = '';
-
-    while (true) {
+    while(true) {
       const {done, value} = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, {stream: true});
-      const lines = buf.split('\n');
-      buf = lines.pop();
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          try { handleEvt(JSON.parse(line.slice(6)), subject); } catch(e) {}
-        }
+      if(done) break;
+      buf += decoder.decode(value, {stream:true});
+      const parts = buf.split('\n\n');
+      buf = parts.pop();
+      for(const part of parts){
+        if(!part.startsWith('data:')) continue;
+        let d; try{ d=JSON.parse(part.slice(5).trim()); } catch{ continue; }
+        if(d.type==='ping') continue; // keepalive
+        handleEvent(d, reportHtml, (h)=>{ reportHtml=h; });
       }
     }
-  } catch(e) {
-    if (e.name !== 'AbortError') showErr('Lỗi kết nối: ' + e.message);
   }
-}
 
-function cancelResearch() {
-  if (abortCtrl) { abortCtrl.abort(); abortCtrl = null; }
-  showPhase('setup');
-}
-
-function handleEvt(evt, subject) {
-  switch (evt.type) {
-    case 'status':
-      document.getElementById('prog-status').textContent = evt.message;
-      break;
-    case 'progress': {
-      const pct = Math.round(evt.step / evt.total * 100);
-      document.getElementById('prog-bar').style.width = pct + '%';
-      document.getElementById('prog-pct').textContent = pct + '%';
-      document.getElementById('prog-label').textContent = evt.label || '';
-      const item = document.createElement('div');
-      item.className = 'flex items-center gap-2 text-sm surface rounded-lg px-3 py-2 fade-in';
-      item.innerHTML = '<span class="text-green-500">✓</span> ' + esc(evt.label || '');
-      document.getElementById('step-list').appendChild(item);
-      item.scrollIntoView({behavior: 'smooth', block: 'nearest'});
-      break;
-    }
-    case 'ai_start':
-      document.getElementById('prog-status').textContent = 'AI đang viết báo cáo...';
-      document.getElementById('partial-wrap').classList.remove('hidden');
-      break;
-    case 'chunk':
-      reportHtml += evt.text;
-      document.getElementById('partial-body').innerHTML += evt.text;
-      break;
-    case 'citations':
-      citations = citations.concat(evt.urls);
-      break;
-    case 'done':
-      currentFile = evt.filename;
-      finishReport(subject);
-      break;
-    case 'error':
-      showErr(evt.message);
-      break;
-  }
-}
-
-function finishReport(subject) {
-  showPhase('report');
-  document.getElementById('rpt-title').textContent = 'Phân Tích Thuế — ' + subject;
-  document.getElementById('rpt-meta').textContent =
-    'Ngày tạo: ' + new Date().toLocaleDateString('vi-VN') +
-    (currentFile ? ' · Đã lưu: ' + currentFile : '');
-
-  const content = document.getElementById('report-content');
-  content.innerHTML = reportHtml;
-  content.style.fontSize = fontSize + 'px';
-
-  // Add AI caveat at bottom
-  const caveat = document.createElement('div');
-  caveat.style.cssText = 'margin-top:2rem;padding:1rem;background:var(--bg);border-top:2px solid var(--border);border-radius:.5rem;font-size:.8rem;color:var(--muted);line-height:1.6';
-  caveat.innerHTML = '<strong>&#9888;&#65039; Lưu ý:</strong> Báo cáo tạo bởi AI (Tax Sector Research). Mang tính tham khảo, không thay thế tư vấn thuế chuyên nghiệp. Kiểm chứng hiệu lực văn bản tại <a href="https://thuvienphapluat.vn" target="_blank" style="color:var(--brand)">thuvienphapluat.vn</a>.';
-  content.appendChild(caveat);
-
-  buildTOC();
-  buildSources();
-  setupScroll();
-  window.scrollTo({top: 0, behavior: 'smooth'});
-}
-
-// ── TOC ───────────────────────────────────────────────────────
-function buildTOC() {
-  const h2s = document.getElementById('report-content').querySelectorAll('h2');
-  if (h2s.length < 2) return;
-  const list = document.getElementById('toc-list');
-  list.innerHTML = '';
-  h2s.forEach((h, i) => {
-    h.id = 'sec-' + i;
-    const a = document.createElement('a');
-    a.href = '#sec-' + i;
-    a.className = 'block text-sm py-0.5 hover:underline';
-    a.style.color = 'var(--brand)';
-    a.textContent = h.textContent;
-    a.onclick = e => { e.preventDefault(); h.scrollIntoView({behavior: 'smooth'}); };
-    list.appendChild(a);
-  });
-  document.getElementById('toc-wrap').classList.remove('hidden');
-}
-
-// ── Sources ───────────────────────────────────────────────────
-function buildSources() {
-  const unique = [...new Set(citations)];
-  if (!unique.length) return;
-  const list = document.getElementById('src-list');
-  list.innerHTML = '';
-  unique.forEach((url, i) => {
-    const d = document.createElement('div');
-    d.className = 'text-xs';
-    d.style.color = 'var(--muted)';
-    d.innerHTML = `[${i+1}] <a href="${esc(url)}" target="_blank" class="hover:underline" style="color:var(--brand)">${esc(url)}</a>`;
-    list.appendChild(d);
-  });
-  document.getElementById('src-count').textContent = unique.length;
-  document.getElementById('src-wrap').classList.remove('hidden');
-}
-
-function toggleSrc() {
-  const list = document.getElementById('src-list');
-  const hidden = list.classList.toggle('hidden');
-  document.getElementById('src-arrow').textContent = hidden ? '▶' : '▼';
-}
-
-// ── Scroll progress ───────────────────────────────────────────
-function setupScroll() {
-  window.addEventListener('scroll', () => {
-    const d = document.documentElement;
-    const pct = d.scrollTop / (d.scrollHeight - d.clientHeight);
-    document.getElementById('reading-bar').style.width = (pct * 100) + '%';
-  });
-}
-
-// ── Toolbar ───────────────────────────────────────────────────
-function chgFont(delta) {
-  fontSize = Math.max(12, Math.min(22, fontSize + delta));
-  document.getElementById('report-content').style.fontSize = fontSize + 'px';
-}
-
-function toggleDark() {
-  dark = !dark;
-  document.body.classList.toggle('dark', dark);
-  const icon = dark ? '🌙' : '☀️';
-  document.getElementById('dark-btn').textContent = icon;
-  const b2 = document.getElementById('dark-btn2');
-  if (b2) b2.textContent = icon;
-}
-
-async function doSlides() {
-  if (!reportHtml) return;
-  const subject = document.getElementById('rpt-title').textContent.replace('Phân Tích Thuế — ', '');
-  const btn = document.getElementById('btn-slides');
-  btn.textContent = '⏳ Đang tạo PPTX...';
-  btn.disabled = true;
   try {
-    const r = await fetch('/slides', {
-      method: 'POST',
-      headers: {Authorization: AUTH, 'Content-Type': 'application/json'},
-      body: JSON.stringify({html: reportHtml, subject}),
-    });
-    if (r.ok) {
-      const blob = await r.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = (currentFile || subject).replace('.html', '') + '.pptx';
-      a.click();
-      URL.revokeObjectURL(url);
-    } else {
-      alert('Không thể tạo PPTX');
+    while(attempt <= MAX_RETRIES) {
+      try {
+        await doStream();
+        break;
+      } catch(e) {
+        attempt++;
+        if(isDone) break;
+        if(attempt > MAX_RETRIES) {
+          document.getElementById('status-text').textContent = `Lỗi sau ${MAX_RETRIES} lần thử: ${e.message}`;
+          break;
+        }
+        const retryMsg = reportHtml
+          ? `Kết nối bị ngắt (lần ${attempt}/${MAX_RETRIES}), đang tiếp tục...`
+          : `Lỗi kết nối (lần ${attempt}/${MAX_RETRIES}), thử lại...`;
+        document.getElementById('status-text').textContent = retryMsg;
+        if(!reportHtml) reportHtml = ''; // full restart if nothing received
+        await new Promise(r=>setTimeout(r, 1500 * attempt));
+      }
     }
-  } catch(e) { alert('Lỗi: ' + e.message); }
-  finally { btn.textContent = '📑 Slides PPTX'; btn.disabled = false; }
+    if(!isDone && reportHtml) finalize(reportHtml);
+  } catch(e){
+    document.getElementById('status-text').textContent = `Lỗi: ${e.message}`;
+  }
 }
 
-async function doDocx() {
-  if (!reportHtml) return;
-  const subject = document.getElementById('rpt-title').textContent.replace('Phân Tích Thuế — ', '');
+function handleEvent(d, reportHtml, setHtml) {
+  if(d.type==='status') document.getElementById('status-text').textContent = d.message;
+
+  if(d.type==='progress'){
+    if(d.step>1) setStepState(d.step-1,'done');
+    setStepState(d.step,'active');
+    const pct = Math.round(((d.step-1)/(d.total+1))*100);
+    document.getElementById('progress-bar').style.width = pct+'%';
+    document.getElementById('status-text').textContent = `Nghiên cứu: ${d.label}...`;
+  }
+
+  if(d.type==='ai_start'){
+    for(let i=1;i<=d.total;i++) setStepState(i,'done');
+    setStepState('ai','active');
+    document.getElementById('progress-bar').style.width = '85%';
+    document.getElementById('report-wrap').classList.remove('hidden');
+  }
+
+  if(d.type==='chunk'){
+    reportHtml += d.text;
+    setHtml(reportHtml);
+    document.getElementById('report-content').innerHTML =
+      reportHtml.replace(/```html\n?/g,'').replace(/```\n?/g,'');
+  }
+
+  if(d.type==='report'){
+    document.getElementById('report-wrap').classList.remove('hidden');
+    document.getElementById('report-content').innerHTML = d.html;
+  }
+
+  if(d.type==='citations') renderSources(d.urls||[]);
+
+  if(d.type==='done'){ finalize(reportHtml); }
+
+  if(d.type==='error') document.getElementById('status-text').textContent = `Lỗi: ${d.message}`;
+}
+
+let reportHtmlGlobal = '';
+let subjectGlobal = '';
+
+function finalize(reportHtml){
+  isDone = true;
+  reportHtmlGlobal = reportHtml;
+  subjectGlobal = getSubject();
+  setStepState('ai','done');
+  document.getElementById('progress-bar').style.width='100%';
+  document.getElementById('progress-wrap').classList.add('hidden');
+  document.getElementById('disclaimer').classList.remove('hidden');
+  document.getElementById('gen-date').textContent = new Date().toLocaleDateString('vi-VN');
+  const c = document.getElementById('report-content');
+  c.innerHTML = c.innerHTML.replace(/```html\n?/g,'').replace(/```\n?/g,'');
+  buildTOC();
+  initReadingProgress();
+  setTimeout(()=>document.getElementById('report-wrap').scrollIntoView({behavior:'smooth',block:'start'}),300);
+}
+
+// ── TOC & Reading Progress ────────────────────────────────────────────────────
+function buildTOC() {
+  const headings = document.querySelectorAll('#report-content h2');
+  if(headings.length < 2){ document.getElementById('toc-sidebar').style.display='none'; return; }
+  const tocEl = document.getElementById('toc-items');
+  tocEl.innerHTML = '';
+  headings.forEach((h, i) => {
+    const id = `section-${i}`;
+    h.id = id;
+    const a = document.createElement('a');
+    a.className = 'toc-item';
+    a.textContent = h.textContent.replace(/^\d+\.\s*/,'');
+    a.href = `#${id}`;
+    a.onclick = (e) => { e.preventDefault(); h.scrollIntoView({behavior:'smooth',block:'start'}); };
+    tocEl.appendChild(a);
+  });
+  document.getElementById('toc-sidebar').style.display='block';
+}
+
+function initReadingProgress(){
+  const bar = document.getElementById('reading-progress');
+  const pctEl = document.getElementById('toc-pct');
+  const tocItems = document.querySelectorAll('.toc-item');
+  const headings = document.querySelectorAll('#report-content h2');
+
+  window.addEventListener('scroll', () => {
+    // Progress bar
+    const scrollTop = window.scrollY;
+    const docH = document.documentElement.scrollHeight - window.innerHeight;
+    const pct = docH > 0 ? Math.round((scrollTop / docH) * 100) : 0;
+    bar.style.width = pct + '%';
+    if(pctEl) pctEl.textContent = pct;
+
+    // Highlight active TOC item
+    let active = 0;
+    headings.forEach((h, i) => {
+      if(h.getBoundingClientRect().top < 120) active = i;
+    });
+    tocItems.forEach((item, i) => {
+      item.classList.toggle('active', i === active);
+    });
+  }, {passive:true});
+}
+
+function setStepState(n, state){
+  const el = document.getElementById(`step-${n}`); if(!el) return;
+  const dot = el.querySelector('.step-dot');
+  el.classList.remove('step-done','step-active','text-gray-400');
+  dot.classList.remove('dot-done','dot-active');
+  if(state==='done')  { el.classList.add('step-done');   dot.classList.add('dot-done');   dot.innerHTML='✓'; }
+  else if(state==='active'){ el.classList.add('step-active'); dot.classList.add('dot-active'); dot.innerHTML='⟳'; }
+  else                { el.classList.add('text-gray-400'); }
+}
+
+function renderSources(urls){
+  if(!urls?.length) return;
+  document.getElementById('sources-section').classList.remove('hidden');
+  document.getElementById('sources-count').textContent = `${urls.length} nguồn`;
+  document.getElementById('sources-list').innerHTML = urls.map((u,i)=>{
+    const d=u.replace(/^https?:\/\//,'').substring(0,90);
+    return `<div class="flex gap-2"><span class="text-gray-400 shrink-0">[${i+1}]</span><a href="${u}" target="_blank" rel="noopener" class="text-p hover:opacity-80 underline break-all text-xs">${d}</a></div>`;
+  }).join('');
+}
+
+// ── Font size ──────────────────────────────────────────────────────────────────
+let fontSizeStep = 0; // steps from base
+function changeFontSize(delta){
+  fontSizeStep = Math.max(-3, Math.min(5, fontSizeStep + delta));
+  const base = 1 + fontSizeStep * 0.06;
+  const rc = document.getElementById('report-content');
+  if(rc) rc.style.fontSize = base + 'rem';
+  // Also adjust headings proportionally
+  const style = document.getElementById('dynamic-font-style') || (() => {
+    const s = document.createElement('style');
+    s.id = 'dynamic-font-style';
+    document.head.appendChild(s);
+    return s;
+  })();
+  const h2size = (1.3 + fontSizeStep * 0.06).toFixed(2);
+  const h3size = (1.1 + fontSizeStep * 0.06).toFixed(2);
+  style.textContent = `#report-content h2{font-size:${h2size}rem!important} #report-content h3{font-size:${h3size}rem!important} #report-content li,#report-content td{font-size:${(0.95+fontSizeStep*0.06).toFixed(2)}rem!important}`;
+}
+
+function copyReport(){
+  const t=document.getElementById('report-content').innerText;
+  navigator.clipboard.writeText(t).then(()=>{
+    const b=event.target; const o=b.textContent;
+    b.textContent='✓ Đã copy!'; setTimeout(()=>b.textContent=o,2000);
+  });
+}
+
+function resetForm(){
+  document.getElementById('report-wrap').classList.add('hidden');
+  document.getElementById('progress-wrap').classList.add('hidden');
+  window.scrollTo({top:0,behavior:'smooth'});
+}
+
+// ── Export DOCX ──────────────────────────────────────────────────────────────
+async function exportDocx(){
+  const html = document.getElementById('report-content').innerHTML;
+  const subject = subjectGlobal || document.getElementById('report-title').textContent || 'BaoCao';
+  if(!html){ alert('Chưa có báo cáo.'); return; }
   const btn = document.getElementById('btn-docx');
   btn.textContent = '⏳ Đang xuất...';
   btn.disabled = true;
   try {
-    const r = await fetch('/docx', {
-      method: 'POST',
-      headers: {Authorization: AUTH, 'Content-Type': 'application/json'},
-      body: JSON.stringify({html: reportHtml, subject}),
+    const resp = await apiFetch('/docx', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({html, subject})
     });
-    if (r.ok) {
-      const blob = await r.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = (currentFile || subject).replace('.html', '') + '.docx';
-      a.click();
-      URL.revokeObjectURL(url);
-    } else {
-      alert('Không thể xuất Word');
-    }
-  } catch(e) { alert('Lỗi: ' + e.message); }
-  finally { btn.textContent = '📄 Word'; btn.disabled = false; }
+    if(!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `TaxReport_${subject.slice(0,30)}_${new Date().toISOString().slice(0,10)}.docx`;
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch(e){ alert(`Lỗi xuất Word: ${e.message}`); }
+  finally { btn.textContent='📄 Word'; btn.disabled=false; }
 }
 
-// ── Reports modal ─────────────────────────────────────────────
-async function openReports() {
-  openModal('modal-reports');
-  const list = document.getElementById('reports-list');
-  list.innerHTML = '<p class="text-sm text-center py-4" style="color:var(--muted)">Đang tải...</p>';
-  try {
-    const r = await fetch('/reports', {headers: {Authorization: AUTH}});
-    const rpts = await r.json();
-    if (!rpts.length) {
-      list.innerHTML = '<p class="text-sm text-center py-4" style="color:var(--muted)">Chưa có báo cáo nào</p>';
-      return;
-    }
-    list.innerHTML = '';
-    rpts.forEach(rpt => {
-      const div = document.createElement('div');
-      div.className = 'flex items-center gap-2 p-3 rounded-lg border fade-in';
-      div.style.borderColor = 'var(--border)';
-      div.innerHTML = `
+async function showReports(){
+  document.getElementById('reports-modal').classList.remove('hidden');
+  await loadReportsList();
+}
+
+async function loadReportsList(){
+  const list=document.getElementById('reports-list');
+  list.innerHTML='<p class="text-sm text-gray-400">Đang tải...</p>';
+  try{
+    const data=await(await apiFetch('/reports')).json();
+    // Sort newest first
+    data.sort((a,b)=>(b.mtime||0)-(a.mtime||0));
+    if(!data.length){ list.innerHTML='<p class="text-sm text-gray-400">Chưa có báo cáo nào.</p>'; return; }
+    list.innerHTML=data.map(f=>{
+      const displayName = f.name.replace(/\.html$/, '');
+      const datePart = f.name.slice(0,8).replace(/(\d{4})(\d{2})(\d{2})/,'$3/$2/$1');
+      return `
+      <div class="flex items-center gap-2 bg-gray-50 p-3 rounded-xl border border-gray-200" id="row-${encodeURIComponent(f.name)}">
         <div class="flex-1 min-w-0">
-          <p class="font-medium text-sm truncate">${esc(rpt.name)}</p>
-          <p class="text-xs" style="color:var(--muted)">${rpt.date} · ${rpt.size}</p>
+          <div class="text-sm font-medium text-gray-800 truncate">${displayName}</div>
+          <div class="text-xs text-gray-400">${datePart} · ${(f.size/1024).toFixed(0)} KB</div>
         </div>
-        <button onclick="loadSavedReport('${esc(rpt.name)}')" class="btn btn-green text-xs shrink-0">📂 Mở</button>
-        <a href="/report/${encodeURIComponent(rpt.name)}" target="_blank"
-           class="btn btn-gray text-xs shrink-0">↗</a>
-        <button onclick="delReport('${esc(rpt.name)}',this)" class="btn text-xs shrink-0 text-red-400 hover:bg-red-50">🗑</button>`;
-      list.appendChild(div);
-    });
-  } catch(e) {
-    list.innerHTML = '<p class="text-sm text-center py-4 text-red-500">Lỗi tải danh sách</p>';
-  }
+        <button onclick="openReportInApp('${f.name}')" class="text-xs bg-green-50 text-green-700 hover:bg-green-100 border border-green-200 px-2 py-1.5 rounded-lg font-medium flex-shrink-0">📂 Mở</button>
+        <a href="${f.url}" target="_blank" class="text-xs text-gray-500 hover:text-gray-700 px-2 py-1.5 rounded-lg font-medium flex-shrink-0" title="Mở tab mới">↗</a>
+        <button onclick="deleteReport('${f.name}')" class="text-xs text-gray-400 hover:text-red-500 hover:bg-red-50 px-2 py-1.5 rounded-lg flex-shrink-0 transition-colors" title="Xóa báo cáo">🗑</button>
+      </div>`}).join('');
+  } catch(e){ list.innerHTML=`<p class="text-sm text-red-500">Lỗi: ${e.message}</p>`; }
 }
 
-async function loadSavedReport(name) {
-  closeModal('modal-reports');
+// Open saved report inside the main app (full toolbar, font controls, dashboard, slides)
+async function openReportInApp(fname){
+  closeReports();
   try {
-    const r = await fetch('/report/' + encodeURIComponent(name), {headers: {Authorization: AUTH}});
-    const html = await r.text();
+    const resp = await apiFetch(`/report/${encodeURIComponent(fname)}`);
+    if(!resp.ok) throw new Error('Không tải được báo cáo');
+    const savedHtml = await resp.text();
     const parser = new DOMParser();
-    const doc = parser.parseFromString(html, 'text/html');
-    const body = doc.getElementById('report-body');
-    reportHtml = body ? body.innerHTML : doc.body.innerHTML;
-    currentFile = name;
-    citations = [];
-
-    // Try to extract title
-    const h1 = doc.querySelector('h1');
-    const subject = h1 ? h1.textContent.replace('Phan Tich Thue — ', '').replace('Phân Tích Thuế — ', '') : name;
-
-    showPhase('report');
-    document.getElementById('rpt-title').textContent = 'Phân Tích Thuế — ' + subject;
-    document.getElementById('rpt-meta').textContent = 'Đã lưu: ' + name;
-    document.getElementById('report-content').innerHTML = reportHtml;
-    document.getElementById('report-content').style.fontSize = fontSize + 'px';
-    document.getElementById('toc-wrap').classList.add('hidden');
-    document.getElementById('src-wrap').classList.add('hidden');
+    const savedDoc = parser.parseFromString(savedHtml, 'text/html');
+    // Extract report content inner HTML
+    const reportDiv = savedDoc.querySelector('#report-content');
+    const reportInner = reportDiv ? reportDiv.innerHTML : savedDoc.body.innerHTML;
+    // Extract subject from title or filename
+    const titleEl = savedDoc.querySelector('h1');
+    const savedTitle = titleEl
+      ? titleEl.textContent.replace(/^Phân Tích Thuế\s*[—-]\s*/,'').trim()
+      : fname.replace(/^\d+ - /,'').replace(/ - \d+\.html$/,'');
+    // Extract citation URLs
+    const sourceLinks = [...new Set(Array.from(savedDoc.querySelectorAll('a[href^="http"]')).map(a=>a.href))];
+    // Load into app UI
+    subjectGlobal = savedTitle;
+    reportHtmlGlobal = reportInner;
+    isDone = true;
+    document.getElementById('report-wrap').classList.remove('hidden');
+    document.getElementById('report-title').textContent = 'Phân Tích Thuế — ' + savedTitle;
+    const datePart = fname.slice(0,8).replace(/(\d{4})(\d{2})(\d{2})/,'$3/$2/$1');
+    document.getElementById('report-date').textContent = datePart + ' · đã lưu · Perplexity + Claude AI';
+    document.getElementById('progress-wrap').classList.add('hidden');
+    document.getElementById('disclaimer').classList.remove('hidden');
+    document.getElementById('gen-date').textContent = datePart;
+    const c = document.getElementById('report-content');
+    c.innerHTML = reportInner;
+    c.innerHTML = c.innerHTML.replace(/```html\n?/g,'').replace(/```\n?/g,'');
+    if(sourceLinks.length){
+      document.getElementById('sources-count').textContent = sourceLinks.length + ' nguồn';
+      const sl = document.getElementById('sources-list');
+      sl.innerHTML = sourceLinks.slice(0,60).map((u,i)=>`<div><span class="text-green-700 font-bold">[${i+1}]</span> <a href="${u}" target="_blank" class="hover:underline break-all text-xs">${u}</a></div>`).join('');
+      document.getElementById('sources-section').classList.remove('hidden');
+    }
     buildTOC();
-    setupScroll();
-    window.scrollTo({top: 0, behavior: 'smooth'});
-  } catch(e) { alert('Không thể tải báo cáo: ' + e.message); }
+    initReadingProgress();
+    window.scrollTo({top:0, behavior:'smooth'});
+  } catch(e){ alert('Lỗi mở báo cáo: ' + e.message); }
 }
 
-async function delReport(name, btn) {
-  if (!confirm('Xóa báo cáo "' + name + '"?')) return;
+async function deleteReport(fname){
+  if(!confirm(`Xóa báo cáo "${fname.replace('.html','')}"?`)) return;
+  try{
+    const r = await apiFetch(`/report/${encodeURIComponent(fname)}`, {method:'DELETE'});
+    if(r.ok){ await loadReportsList(); }
+    else{ alert('Không xóa được báo cáo.'); }
+  } catch(e){ alert(`Lỗi: ${e.message}`); }
+}
+
+function closeReports(){ document.getElementById('reports-modal').classList.add('hidden'); }
+
+
+// ── Dashboard ────────────────────────────────────────────────────────────────
+function openDashboard(){
+  const html = document.getElementById('report-content').innerHTML;
+  const subject = subjectGlobal || document.getElementById('report-title').textContent || 'Báo cáo';
+  const genDate = new Date().toLocaleDateString('vi-VN');
+
+  const parser = new DOMParser();
+  const doc = parser.parseFromString('<div>'+html+'</div>', 'text/html');
+
+  // Extract sections (h2)
+  const sections = Array.from(doc.querySelectorAll('h2')).map(h=>h.textContent.trim());
+
+  // Extract tables
+  const tables = Array.from(doc.querySelectorAll('table')).map(t=>t.outerHTML);
+
+  // Extract risk items (keywords)
+  const riskKW = ['rủi ro','tranh chấp','phạt','vi phạm','thanh tra','truy thu','cưỡng chế','xử phạt'];
+  const allText = doc.body.innerText || doc.body.textContent || '';
+  const sentences = allText.split(/[.!?\n]/).filter(s=>s.trim().length>20);
+  const riskItems = sentences.filter(s=>riskKW.some(k=>s.toLowerCase().includes(k))).slice(0,10);
+
+  // Extract numbers/metrics
+  const numRegex = /(\d[\d,.]*\s*(?:tỷ|nghìn tỷ|triệu|%|USD|VND|tỷ đồng|nghìn|năm))/gi;
+  const nums = [...new Set((allText.match(numRegex)||[]).slice(0,12))];
+
+  // Count regulations
+  const regCount = (allText.match(/\b(?:Luật|Nghị định|Thông tư|Quyết định|Công văn)\s+(?:số\s+)?\d+/gi)||[]).length;
+
+  // Build section cards HTML
+  const sectionCards = sections.map((s,i)=>`
+    <div class="bg-white rounded-xl border border-gray-200 p-4 hover:border-green-400 hover:shadow-md transition-all cursor-pointer" onclick="scrollToSection(${i})">
+      <div class="text-xs font-bold text-green-700 mb-1">Phần ${i+1}</div>
+      <div class="text-sm font-semibold text-gray-800 leading-snug">${s.replace(/^\d+\.\s*/,'')}</div>
+    </div>`).join('');
+
+  // Build metrics
+  const metricItems = [
+    {icon:'📋', label:'Phần báo cáo', val: sections.length},
+    {icon:'📜', label:'Văn bản PL trích dẫn', val: regCount || 'N/A'},
+    {icon:'⚠️', label:'Điểm rủi ro', val: riskItems.length},
+    {icon:'🔢', label:'Số liệu tham chiếu', val: nums.length},
+  ];
+  const metricsHTML = metricItems.map(m=>`
+    <div class="bg-white rounded-xl border border-gray-200 p-5 text-center">
+      <div class="text-3xl mb-2">${m.icon}</div>
+      <div class="text-3xl font-bold text-green-700">${m.val}</div>
+      <div class="text-xs text-gray-500 mt-1">${m.label}</div>
+    </div>`).join('');
+
+  // Risk cards
+  const riskHTML = riskItems.length ? riskItems.map(r=>`
+    <div class="flex gap-3 bg-amber-50 border border-amber-200 rounded-lg p-3">
+      <span class="text-amber-500 flex-shrink-0">⚠️</span>
+      <p class="text-sm text-amber-900 leading-relaxed">${r.trim()}</p>
+    </div>`).join('') :
+    '<p class="text-sm text-gray-400 italic">Không phát hiện điểm rủi ro nổi bật.</p>';
+
+  // Tables HTML
+  const tablesHTML = tables.length ? tables.map((t,i)=>`
+    <div class="mb-6">
+      <div class="text-xs font-bold text-gray-500 mb-2">Bảng ${i+1}</div>
+      <div class="overflow-x-auto rounded-xl border border-gray-200">${t}</div>
+    </div>`).join('') :
+    '<p class="text-sm text-gray-400 italic">Không có bảng dữ liệu.</p>';
+
+  // Numbers list
+  const numsHTML = nums.length ? `<div class="flex flex-wrap gap-2">${nums.map(n=>`<span class="bg-green-50 text-green-800 border border-green-200 rounded-full px-3 py-1 text-xs font-semibold">${n.trim()}</span>`).join('')}</div>` :
+    '<p class="text-sm text-gray-400 italic">Không trích xuất được số liệu.</p>';
+
+  const dashHTML = `<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Dashboard — ${subject}</title>
+<script src="https://cdn.tailwindcss.com"><\/script>
+<style>
+  body{font-family:Arial,sans-serif;background:#f9fafb}
+  table{width:100%;border-collapse:collapse;font-size:.9rem}
+  th{background:#028a39;color:#fff;padding:.5rem .75rem;text-align:left;font-size:.82rem}
+  td{padding:.45rem .75rem;border-bottom:1px solid #e5e7eb;font-size:.88rem;vertical-align:top}
+  tr:nth-child(even) td{background:#f0fdf4}
+</style></head>
+<body class="p-6 max-w-6xl mx-auto">
+  <div class="bg-gradient-to-r from-green-700 to-green-500 text-white rounded-2xl p-8 mb-6">
+    <div class="text-xs font-bold opacity-70 uppercase tracking-widest mb-2">📊 Visual Dashboard · Tax Research</div>
+    <h1 class="text-2xl font-bold mb-1">${subject}</h1>
+    <div class="text-green-100 text-sm">${genDate} · Perplexity + Claude AI</div>
+  </div>
+
+  <div class="grid grid-cols-4 gap-4 mb-6">${metricsHTML}</div>
+
+  <div class="grid grid-cols-3 gap-6 mb-6">
+    <div class="col-span-2 bg-white rounded-2xl border border-gray-200 p-5">
+      <h2 class="text-base font-bold text-gray-700 mb-4">📑 Các phần báo cáo</h2>
+      <div class="grid grid-cols-2 gap-3">${sectionCards}</div>
+    </div>
+    <div class="bg-white rounded-2xl border border-gray-200 p-5">
+      <h2 class="text-base font-bold text-gray-700 mb-4">🔢 Số liệu nổi bật</h2>
+      ${numsHTML}
+    </div>
+  </div>
+
+  <div class="bg-white rounded-2xl border border-gray-200 p-5 mb-6">
+    <h2 class="text-base font-bold text-gray-700 mb-4">📋 Bảng dữ liệu từ báo cáo</h2>
+    ${tablesHTML}
+  </div>
+
+  <div class="bg-white rounded-2xl border border-gray-200 p-5 mb-6">
+    <h2 class="text-base font-bold text-amber-700 mb-4">⚠️ Điểm rủi ro & Lưu ý</h2>
+    <div class="space-y-2">${riskHTML}</div>
+  </div>
+
+  <div class="text-xs text-gray-400 text-center py-4">Dashboard tự động từ Tax Sector Research Tool · ${genDate}</div>
+</body></html>`;
+
+  const w = window.open('','_blank');
+  w.document.write(dashHTML);
+  w.document.close();
+}
+
+// ── Slides ────────────────────────────────────────────────────────────────────
+async function openSlides(){
+  const html = document.getElementById('report-content').innerHTML;
+  const subject = subjectGlobal || document.getElementById('report-title').textContent || 'Báo cáo';
+  if(!html){ alert('Chưa có báo cáo để tạo slides.'); return; }
+
+  const btn = document.getElementById('btn-slides');
+  btn.textContent = '⏳ Đang tạo...';
+  btn.disabled = true;
+
   try {
-    const r = await fetch('/report/' + encodeURIComponent(name), {
-      method: 'DELETE', headers: {Authorization: AUTH}
+    const resp = await apiFetch('/slides', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({html, subject})
     });
-    if (r.ok) btn.closest('.flex').remove();
-    else alert('Không thể xóa');
-  } catch(e) { alert('Lỗi: ' + e.message); }
-}
-
-function newReport() {
-  if (currentFile || reportHtml) {
-    if (!confirm('Bắt đầu báo cáo mới? Báo cáo hiện tại vẫn được lưu.')) return;
+    if(!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const slidesHtml = await resp.text();
+    const w = window.open('','_blank');
+    w.document.write(slidesHtml);
+    w.document.close();
+  } catch(e){
+    alert(`Không tạo được slides: ${e.message}`);
+  } finally {
+    btn.textContent = '📑 Slides';
+    btn.disabled = false;
   }
-  showPhase('setup');
-  reportHtml = ''; currentFile = null; citations = [];
-  document.getElementById('step-list').innerHTML = '';
-  document.getElementById('partial-body').innerHTML = '';
-  document.getElementById('report-content').innerHTML = '';
-  document.getElementById('toc-wrap').classList.add('hidden');
-  document.getElementById('src-wrap').classList.add('hidden');
-  window.scrollTo({top: 0, behavior: 'smooth'});
 }
 
-// ── Helpers ───────────────────────────────────────────────────
-function showPhase(p) {
-  ['setup','progress','report'].forEach(x =>
-    document.getElementById('ph-' + x).classList.toggle('hidden', x !== p));
+
+// ── Legal Appendix ────────────────────────────────────────────────────────────
+async function openAppendix(){
+  const subject = subjectGlobal || document.getElementById('subject-input')?.value || '';
+  const btn = document.getElementById('btn-appendix');
+  btn.textContent = '⏳ Đang tạo...';
+  btn.disabled = true;
+  try {
+    const resp = await apiFetch('/legal-appendix', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({subject: subject, report_html: document.getElementById('report-content')?.innerHTML || ''})
+    });
+    if(!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+    // Show in modal or new window
+    const w = window.open('','_blank');
+    w.document.write('<html><body style="font-family:sans-serif;padding:24px">' + data.appendix_html + '</body></html>');
+    w.document.close();
+  } catch(e){
+    alert('Không tạo được Appendix: ' + e.message);
+  } finally {
+    btn.textContent = '📋 Appendix';
+    btn.disabled = false;
+  }
 }
 
-function showErr(msg) {
-  document.getElementById('prog-status').textContent = '❌ ' + msg;
-  document.getElementById('prog-bar').style.background = '#ef4444';
-}
-
-function openModal(id)  { document.getElementById(id).classList.remove('hidden'); }
-function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
-
-// Close modal on backdrop click
-document.querySelectorAll('[id^="modal-"]').forEach(m =>
-  m.addEventListener('click', e => { if (e.target === m) closeModal(m.id); }));
-
-document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') closeModal('modal-reports');
-});
+// ── Init ─────────────────────────────────────────────────────────────────────
+loadDefaultSections();
 </script>
 </body>
 </html>"""
 
-# ── Favicon ───────────────────────────────────────────────────────────────────
-@app.get("/favicon.svg", include_in_schema=False)
-async def favicon():
-    import pathlib
-    svg_path = pathlib.Path(__file__).parent / "favicon.svg"
-    if svg_path.exists():
-        return FileResponse(svg_path, media_type="image/svg+xml")
-    return Response(status_code=404)
 
-# ── Serve frontend ────────────────────────────────────────────────────────────
-@app.get("/", response_class=HTMLResponse)
-def root():
-    return HTMLResponse(HTML_PAGE)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LEGAL REFERENCES API — Văn bản pháp luật liên quan đến chủ đề
+# ─────────────────────────────────────────────────────────────────────────────
+
+import urllib.request as _urllib_req
+
+LEGAL_DB_URL = "https://raw.githubusercontent.com/phanvuhoang/taxsector/main/legal_db.json"
+
+# Embedded fallback DB (top key docs per category)
+LEGAL_DB_EMBEDDED = {
+    "CIT": [
+        {"so_hieu": "14/2008/QH12", "ten": "Luật Thuế Thu nhập Doanh nghiệp 2008 (đã sửa đổi)", "tinh_trang": "Còn hiệu lực", "link": "https://thuvienphapluat.vn/van-ban/Thue-Phi-Le-Phi/Luat-thue-thu-nhap-doanh-nghiep-2008-14-2008-QH12-85986.aspx"},
+        {"so_hieu": "218/2013/NĐ-CP", "ten": "NĐ 218/2013 hướng dẫn Luật Thuế TNDN", "tinh_trang": "Còn hiệu lực", "link": "https://thuvienphapluat.vn/van-ban/Thue-Phi-Le-Phi/Nghi-dinh-218-2013-ND-CP-huong-dan-Luat-thue-thu-nhap-doanh-nghiep-216979.aspx"},
+        {"so_hieu": "96/2015/TT-BTC", "ten": "TT 96/2015 về chi phí được trừ CIT", "tinh_trang": "Còn hiệu lực", "link": "https://thuvienphapluat.vn/van-ban/Thue-Phi-Le-Phi/Thong-tu-96-2015-TT-BTC-huong-dan-thue-thu-nhap-doanh-nghiep-286266.aspx"},
+    ],
+    "VAT": [
+        {"so_hieu": "48/2024/QH15", "ten": "Luật Thuế GTGT 2024 (MỚI — hiệu lực 01/07/2025)", "tinh_trang": "Hiệu lực từ 01/07/2025", "link": "https://thuvienphapluat.vn/van-ban/Thue-Phi-Le-Phi/Luat-Thue-gia-tri-gia-tang-2024-48-2024-QH15-634509.aspx"},
+        {"so_hieu": "219/2013/TT-BTC", "ten": "TT 219/2013 hướng dẫn Luật Thuế GTGT", "tinh_trang": "Còn hiệu lực", "link": "https://thuvienphapluat.vn/van-ban/Thue-Phi-Le-Phi/Thong-tu-219-2013-TT-BTC-huong-dan-Luat-Thue-gia-tri-gia-tang-220100.aspx"},
+    ],
+    "PIT": [
+        {"so_hieu": "04/2007/QH12", "ten": "Luật Thuế Thu nhập Cá nhân 2007 (đã sửa đổi)", "tinh_trang": "Còn hiệu lực", "link": "https://thuvienphapluat.vn/van-ban/Thue-Phi-Le-Phi/Luat-Thue-thu-nhap-ca-nhan-2007-04-2007-QH12-65387.aspx"},
+        {"so_hieu": "NQ 954/2020", "ten": "NQ 954/2020 — Giảm trừ gia cảnh: bản thân 11tr, phụ thuộc 4.4tr/tháng", "tinh_trang": "Còn hiệu lực", "link": "https://thuvienphapluat.vn/van-ban/Thue-Phi-Le-Phi/Nghi-quyet-954-2020-UBTVQH14-dieu-chinh-muc-giam-tru-gia-canh-thue-thu-nhap-ca-nhan-444439.aspx"},
+        {"so_hieu": "111/2013/TT-BTC", "ten": "TT 111/2013 hướng dẫn Luật Thuế TNCN", "tinh_trang": "Còn hiệu lực", "link": "https://thuvienphapluat.vn/van-ban/Thue-Phi-Le-Phi/Thong-tu-111-2013-TT-BTC-huong-dan-Luat-Thue-thu-nhap-ca-nhan-201324.aspx"},
+    ],
+    "TransferPricing": [
+        {"so_hieu": "132/2020/NĐ-CP", "ten": "NĐ 132/2020 — Quản lý thuế giao dịch liên kết (HIỆN HÀNH)", "tinh_trang": "Còn hiệu lực", "link": "https://thuvienphapluat.vn/van-ban/Thue-Phi-Le-Phi/Nghi-dinh-132-2020-ND-CP-quan-ly-thue-doanh-nghiep-giao-dich-lien-ket-459208.aspx"},
+        {"so_hieu": "45/2021/TT-BTC", "ten": "TT 45/2021 hướng dẫn NĐ 132/2020 về chuyển giá", "tinh_trang": "Còn hiệu lực", "link": "https://thuvienphapluat.vn/van-ban/Thue-Phi-Le-Phi/Thong-tu-45-2021-TT-BTC-huong-dan-Nghi-dinh-132-2020-ND-CP-giao-dich-lien-ket-481827.aspx"},
+        {"so_hieu": "20/2017/NĐ-CP", "ten": "NĐ 20/2017 ⛔ ĐÃ HẾT HIỆU LỰC — thay bởi NĐ 132/2020", "tinh_trang": "HẾT HIỆU LỰC", "link": ""},
+    ],
+    "TaxAdmin": [
+        {"so_hieu": "38/2019/QH14", "ten": "Luật Quản lý Thuế 2019 (hiệu lực 01/07/2020)", "tinh_trang": "Còn hiệu lực", "link": "https://thuvienphapluat.vn/van-ban/Thue-Phi-Le-Phi/Luat-Quan-ly-thue-2019-38-2019-QH14-393760.aspx"},
+        {"so_hieu": "126/2020/NĐ-CP", "ten": "NĐ 126/2020 hướng dẫn Luật Quản lý Thuế", "tinh_trang": "Còn hiệu lực", "link": "https://thuvienphapluat.vn/van-ban/Thue-Phi-Le-Phi/Nghi-dinh-126-2020-ND-CP-huong-dan-Luat-quan-ly-thue-457344.aspx"},
+        {"so_hieu": "80/2021/TT-BTC", "ten": "TT 80/2021 hướng dẫn kê khai, nộp thuế, hoàn thuế", "tinh_trang": "Còn hiệu lực", "link": "https://thuvienphapluat.vn/van-ban/Thue-Phi-Le-Phi/Thong-tu-80-2021-TT-BTC-huong-dan-Luat-Quan-ly-thue-Nghi-dinh-126-2020-ND-CP-491201.aspx"},
+    ],
+    "FCT": [
+        {"so_hieu": "103/2014/TT-BTC", "ten": "TT 103/2014 — Thuế nhà thầu nước ngoài (HIỆN HÀNH)", "tinh_trang": "Còn hiệu lực", "link": "https://thuvienphapluat.vn/van-ban/Thue-Phi-Le-Phi/Thong-tu-103-2014-TT-BTC-huong-dan-thuc-hien-nghia-vu-thue-ap-dung-doi-voi-to-chuc-ca-nhan-nuoc-ngoai-238461.aspx"},
+    ],
+    "HoaDon": [
+        {"so_hieu": "123/2020/NĐ-CP", "ten": "NĐ 123/2020 — Hóa đơn, chứng từ (bắt buộc từ 01/07/2022)", "tinh_trang": "Còn hiệu lực", "link": "https://thuvienphapluat.vn/van-ban/Thue-Phi-Le-Phi/Nghi-dinh-123-2020-ND-CP-hoa-don-chung-tu-457339.aspx"},
+        {"so_hieu": "78/2021/TT-BTC", "ten": "TT 78/2021 hướng dẫn hóa đơn điện tử", "tinh_trang": "Còn hiệu lực", "link": "https://thuvienphapluat.vn/van-ban/Thue-Phi-Le-Phi/Thong-tu-78-2021-TT-BTC-huong-dan-Nghi-dinh-123-2020-ND-CP-hoa-don-chung-tu-491185.aspx"},
+    ],
+    "InternationalTax": [
+        {"so_hieu": "205/2013/TT-BTC", "ten": "TT 205/2013 hướng dẫn áp dụng Hiệp định tránh đánh thuế hai lần", "tinh_trang": "Còn hiệu lực", "link": "https://thuvienphapluat.vn/van-ban/Thue-Phi-Le-Phi/Thong-tu-205-2013-TT-BTC-huong-dan-Hiep-dinh-tranh-danh-thue-hai-lan-220619.aspx"},
+        {"so_hieu": "NQ 107/2023/QH15", "ten": "NQ 107/2023 — Thuế tối thiểu toàn cầu Pillar 2 (15%) từ 2024", "tinh_trang": "Còn hiệu lực", "link": ""},
+    ],
+    "DatDai": [
+        {"so_hieu": "31/2024/QH15", "ten": "Luật Đất đai 2024 — hiệu lực 01/08/2024, ảnh hưởng lớn BĐS", "tinh_trang": "Còn hiệu lực từ 01/08/2024", "link": "https://thuvienphapluat.vn/van-ban/Bat-dong-san/Luat-Dat-dai-2024-31-2024-QH15-571019.aspx"},
+        {"so_hieu": "48/2010/QH12", "ten": "Luật Thuế sử dụng đất phi nông nghiệp", "tinh_trang": "Còn hiệu lực", "link": ""},
+    ],
+}
+
+# Keyword → category mapping
+LEGAL_KEYWORD_MAP = {
+    "cit": ["CIT"], "thuế tndn": ["CIT"], "thu nhập doanh nghiệp": ["CIT"], "corporate": ["CIT"],
+    "vat": ["VAT"], "gtgt": ["VAT"], "giá trị gia tăng": ["VAT"], "value added": ["VAT"],
+    "pit": ["PIT"], "tncn": ["PIT"], "thu nhập cá nhân": ["PIT"], "personal income": ["PIT"],
+    "chuyển giá": ["TransferPricing"], "transfer pricing": ["TransferPricing"], "giao dịch liên kết": ["TransferPricing"],
+    "nhà thầu": ["FCT"], "foreign contractor": ["FCT"], "fct": ["FCT"], "withholding": ["FCT"],
+    "hóa đơn": ["HoaDon"], "invoice": ["HoaDon"], "chứng từ": ["HoaDon"],
+    "quản lý thuế": ["TaxAdmin"], "kê khai": ["TaxAdmin"], "hoàn thuế": ["TaxAdmin"],
+    "hiệp định": ["InternationalTax"], "dta": ["InternationalTax"], "tax treaty": ["InternationalTax"], "pillar": ["InternationalTax"], "tối thiểu": ["InternationalTax"],
+    "đất đai": ["DatDai"], "bất động sản": ["DatDai"], "real estate": ["DatDai"], "bds": ["DatDai"],
+    "tiêu thụ đặc biệt": ["SCT"], "excise": ["SCT"],
+    "hộ kinh doanh": ["HoaDon", "PIT"], "hộ kd": ["HoaDon", "PIT"], "thuế khoán": ["PIT"],
+}
+
+def get_relevant_legal_cats(subject: str, sections: list = None) -> list:
+    """Determine relevant legal categories from subject/sections."""
+    subject_lower = subject.lower()
+    cats = set()
+    for kw, cat_list in LEGAL_KEYWORD_MAP.items():
+        if kw in subject_lower:
+            cats.update(cat_list)
+    # Always include TaxAdmin for tax research
+    if cats:
+        cats.add("TaxAdmin")
+    return list(cats) if cats else list(LEGAL_DB_EMBEDDED.keys())
+
+@app.get("/legal-refs")
+async def get_legal_refs(
+    subject: str = "",
+    cats: str = "",
+    user: str = Depends(check_auth)
+):
+    """Return relevant legal references for a given subject."""
+    if cats:
+        selected_cats = [c.strip() for c in cats.split(",") if c.strip() in LEGAL_DB_EMBEDDED]
+    else:
+        selected_cats = get_relevant_legal_cats(subject)
+
+    result = {}
+    for cat in selected_cats:
+        if cat in LEGAL_DB_EMBEDDED:
+            result[cat] = LEGAL_DB_EMBEDDED[cat]
+
+    return JSONResponse({"subject": subject, "categories": selected_cats, "refs": result})
+
+@app.post("/legal-appendix")
+async def generate_legal_appendix(request_body: dict, user: str = Depends(check_auth)):
+    """Generate HTML appendix with legal references for a report subject."""
+    subject = request_body.get("subject", "")
+    cats = request_body.get("cats", "")
+    report_html = request_body.get("report_html", "")
+
+    if cats:
+        selected_cats = [c.strip() for c in cats.split(",") if c.strip() in LEGAL_DB_EMBEDDED]
+    else:
+        selected_cats = get_relevant_legal_cats(subject)
+
+    # Build appendix HTML
+    cat_labels = {
+        "CIT": "Thuế Thu nhập Doanh nghiệp (CIT)",
+        "VAT": "Thuế Giá trị Gia tăng (VAT/GTGT)",
+        "PIT": "Thuế Thu nhập Cá nhân (PIT/TNCN)",
+        "TransferPricing": "Chuyển giá / Giao dịch liên kết",
+        "TaxAdmin": "Quản lý Thuế",
+        "FCT": "Thuế Nhà thầu Nước ngoài (FCT)",
+        "HoaDon": "Hóa đơn & Chứng từ",
+        "InternationalTax": "Thuế Quốc tế / Tax Treaty",
+        "DatDai": "Thuế Đất đai & Bất động sản",
+        "SCT": "Thuế Tiêu thụ Đặc biệt (SCT)",
+    }
+
+    rows_html = ""
+    for cat in selected_cats:
+        docs = LEGAL_DB_EMBEDDED.get(cat, [])
+        if not docs:
+            continue
+        label = cat_labels.get(cat, cat)
+        for doc in docs:
+            status_color = "#dc2626" if "HẾT HIỆU LỰC" in doc.get("tinh_trang","") else "#16a34a"
+            link = doc.get("link","")
+            sh = doc.get("so_hieu","")
+            sh_html = f'<a href="{link}" target="_blank" style="color:#1d4ed8">{sh}</a>' if link else sh
+            rows_html += f"""
+            <tr>
+              <td style="padding:6px 8px;border-bottom:1px solid #e5e7eb;font-weight:500;white-space:nowrap">{label}</td>
+              <td style="padding:6px 8px;border-bottom:1px solid #e5e7eb;white-space:nowrap">{sh_html}</td>
+              <td style="padding:6px 8px;border-bottom:1px solid #e5e7eb;font-size:13px">{doc.get("ten","")}</td>
+              <td style="padding:6px 8px;border-bottom:1px solid #e5e7eb;color:{status_color};white-space:nowrap;font-size:12px">{doc.get("tinh_trang","")}</td>
+            </tr>"""
+
+    from datetime import datetime
+    gen_date = datetime.now().strftime("%d/%m/%Y")
+    appendix_html = f"""
+<div style="margin-top:32px;padding:24px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;font-family:sans-serif">
+  <h2 style="font-size:16px;font-weight:700;color:#1e40af;margin:0 0 4px 0">📋 PHỤ LỤC — Văn bản Pháp quy Áp dụng</h2>
+  <p style="font-size:12px;color:#64748b;margin:0 0 16px 0">Chủ đề: <strong>{subject}</strong> · Tổng hợp: ThanhAI · {gen_date}</p>
+  <table style="width:100%;border-collapse:collapse;font-size:13px;background:#fff">
+    <thead>
+      <tr style="background:#1e40af;color:#fff">
+        <th style="padding:8px;text-align:left">Lĩnh vực</th>
+        <th style="padding:8px;text-align:left">Số hiệu</th>
+        <th style="padding:8px;text-align:left">Tên văn bản</th>
+        <th style="padding:8px;text-align:left">Tình trạng</th>
+      </tr>
+    </thead>
+    <tbody>{rows_html}</tbody>
+  </table>
+  <p style="font-size:11px;color:#94a3b8;margin:12px 0 0 0">
+    ⚠️ Thông tin tham khảo. Vui lòng kiểm tra trạng thái hiệu lực tại
+    <a href="https://thuvienphapluat.vn" target="_blank">thuvienphapluat.vn</a> hoặc
+    <a href="https://vbpl.vn" target="_blank">vbpl.vn</a>
+  </p>
+</div>"""
+
+    return JSONResponse({"appendix_html": appendix_html, "categories": selected_cats})
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
