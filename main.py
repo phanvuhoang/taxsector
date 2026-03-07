@@ -8,7 +8,14 @@ try:
     from docx.shared import Pt, RGBColor, Inches
     DOCX_OK = True
 except ImportError:
-    DOCX_OK = False
+    try:
+        import subprocess as _pip_sp
+        _pip_sp.run(["pip", "install", "python-docx", "-q"], check=True, timeout=30)
+        from docx import Document as DocxDocument
+        from docx.shared import Pt, RGBColor, Inches
+        DOCX_OK = True
+    except Exception:
+        DOCX_OK = False
 import httpx
 import asyncio
 import json
@@ -1565,7 +1572,7 @@ async function showReports(){
   await loadReportsList();
 }
 
-async function loadReportsList(){
+async function loadReportsList(showAll=false){
   const list=document.getElementById('reports-list');
   list.innerHTML='<p class="text-sm text-gray-400">Đang tải...</p>';
   try{
@@ -1573,7 +1580,9 @@ async function loadReportsList(){
     // Sort newest first
     data.sort((a,b)=>(b.mtime||0)-(a.mtime||0));
     if(!data.length){ list.innerHTML='<p class="text-sm text-gray-400">Chưa có báo cáo nào.</p>'; return; }
-    list.innerHTML=data.map(f=>{
+    const LIMIT = 10;
+    const display = showAll ? data : data.slice(0, LIMIT);
+    const renderRow = f => {
       const displayName = f.name.replace(/\.html$/, '');
       const datePart = f.name.slice(0,8).replace(/(\d{4})(\d{2})(\d{2})/,'$3/$2/$1');
       return `
@@ -1585,7 +1594,16 @@ async function loadReportsList(){
         <button onclick="openReportInApp('${f.name}')" class="text-xs bg-green-50 text-green-700 hover:bg-green-100 border border-green-200 px-2 py-1.5 rounded-lg font-medium flex-shrink-0">📂 Mở</button>
         <a href="${f.url}" target="_blank" class="text-xs text-gray-500 hover:text-gray-700 px-2 py-1.5 rounded-lg font-medium flex-shrink-0" title="Mở tab mới">↗</a>
         <button onclick="deleteReport('${f.name}')" class="text-xs text-gray-400 hover:text-red-500 hover:bg-red-50 px-2 py-1.5 rounded-lg flex-shrink-0 transition-colors" title="Xóa báo cáo">🗑</button>
-      </div>`}).join('');
+      </div>`;
+    };
+    let html = display.map(renderRow).join('');
+    if(!showAll && data.length > LIMIT){
+      html += `<div class="text-center pt-2">
+        <button onclick="loadReportsList(true)" class="text-xs text-green-700 hover:text-green-900 border border-green-200 hover:bg-green-50 px-4 py-2 rounded-lg font-medium">
+          Xem thêm ${data.length - LIMIT} báo cáo...
+        </button></div>`;
+    }
+    list.innerHTML = html;
   } catch(e){ list.innerHTML=`<p class="text-sm text-red-500">Lỗi: ${e.message}</p>`; }
 }
 
@@ -1822,6 +1840,11 @@ async function openAppendix(){
 
 // ── Init ─────────────────────────────────────────────────────────────────────
 loadDefaultSections();
+// Auto-load reports list on page init (show modal-ready data in background)
+window.addEventListener('DOMContentLoaded', () => {
+  // Pre-fetch reports so modal opens instantly
+  loadReportsList().catch(()=>{});
+});
 </script>
 </body>
 </html>"""
