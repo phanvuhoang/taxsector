@@ -6,15 +6,21 @@ from io import BytesIO
 try:
     from docx import Document as DocxDocument
     from docx.shared import Pt, RGBColor, Inches
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
     DOCX_OK = True
+    print("[DOCX] python-docx imported successfully")
 except ImportError:
+    print("[DOCX] python-docx not found, attempting install...")
     try:
         import subprocess as _pip_sp
-        _pip_sp.run(["pip", "install", "python-docx", "-q"], check=True, timeout=30)
+        _pip_sp.run(["pip", "install", "python-docx", "-q"], check=True, timeout=60)
         from docx import Document as DocxDocument
         from docx.shared import Pt, RGBColor, Inches
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
         DOCX_OK = True
-    except Exception:
+        print("[DOCX] python-docx installed and imported")
+    except Exception as e:
+        print(f"[DOCX] Installation failed: {e}")
         DOCX_OK = False
 
 try:
@@ -93,6 +99,16 @@ async def startup():
             _seed_admin_user()
         except Exception as e:
             print(f"[DB] Connection failed (fallback to env auth): {e}")
+
+    # Check rclone for GDrive backup
+    try:
+        result = subprocess.run(["rclone", "version"], capture_output=True, timeout=5)
+        if result.returncode == 0:
+            print("[RCLONE] Available for GDrive backup")
+        else:
+            print("[RCLONE] Not configured or unavailable")
+    except Exception as e:
+        print(f"[RCLONE] Check failed: {e}")
 
 def _seed_admin_user():
     """Ensure admin user (hoang) exists in DB with a valid bcrypt hash."""
@@ -1064,10 +1080,42 @@ async def list_reports(user: dict = Depends(get_current_user)):
     else:
         user_dir = REPORTS_DIR
     files = sorted(user_dir.glob("*.html"), key=lambda f: f.stat().st_mtime, reverse=True)
-    return JSONResponse([{
+    reports = [{
         "name": f.name, "size": f.stat().st_size,
-        "mtime": f.stat().st_mtime, "url": f"/report/{f.name}"
-    } for f in files[:100]])
+        "mtime": f.stat().st_mtime, "url": f"/report/{f.name}",
+        "source": "local"
+    } for f in files[:100]]
+
+    # GDrive reports (if local has < 5)
+    if len(reports) < 5 and shutil.which("rclone"):
+        try:
+            gdrive_folder = f"gdrive:{GDRIVE_FOLDER}/user_{user_id}"
+            result = subprocess.run(
+                ["rclone", "lsjson", gdrive_folder],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                gdrive_files = json.loads(result.stdout)
+                local_names = {r["name"] for r in reports}
+                for f in gdrive_files:
+                    if f["Name"].endswith(".html") and f["Name"] not in local_names:
+                        try:
+                            mtime = datetime.fromisoformat(
+                                f["ModTime"].replace("Z", "+00:00")).timestamp()
+                        except Exception:
+                            mtime = 0
+                        reports.append({
+                            "name": f["Name"],
+                            "size": f.get("Size", 0),
+                            "mtime": mtime,
+                            "url": f"/report/{f['Name']}",
+                            "source": "gdrive"
+                        })
+        except Exception as e:
+            print(f"[REPORTS] GDrive list failed: {e}")
+
+    reports.sort(key=lambda x: x.get("mtime", 0), reverse=True)
+    return JSONResponse(reports[:100])
 
 
 def _find_report_path(fname: str, user_id: int) -> "Path | None":
@@ -1130,26 +1178,39 @@ async def delete_report(fname: str, user: dict = Depends(get_current_user)):
 async def get_report(fname: str, user: dict = Depends(get_current_user)):
     user_id = user.get("id", 0)
     path = _find_report_path(fname, user_id)
-    if not path:
-        raise HTTPException(404)
 
-    # Access control via DB (soft check — falls back to allow if DB unavailable)
-    if db_pool and user_id:
-        conn = get_db_conn()
+    if path:
+        # Access control via DB (soft check — falls back to allow if DB unavailable)
+        if db_pool and user_id:
+            conn = get_db_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT id FROM reports WHERE filename=%s AND user_id=%s",
+                                (fname, user_id))
+                    if not cur.fetchone():
+                        raise HTTPException(403, "Access denied")
+            except HTTPException:
+                raise
+            except Exception:
+                pass  # DB error: allow access
+            finally:
+                release_db_conn(conn)
+        return HTMLResponse(path.read_text(encoding="utf-8"))
+
+    # Try GDrive if not found locally
+    if shutil.which("rclone"):
+        safe_name = re.sub(r'[<>:"/\\|?*]', '', fname)
         try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT id FROM reports WHERE filename=%s AND user_id=%s",
-                            (fname, user_id))
-                if not cur.fetchone():
-                    raise HTTPException(403, "Access denied")
-        except HTTPException:
-            raise
-        except Exception:
-            pass  # DB error: allow access
-        finally:
-            release_db_conn(conn)
+            result = subprocess.run(
+                ["rclone", "cat", f"gdrive:{GDRIVE_FOLDER}/user_{user_id}/{safe_name}"],
+                capture_output=True, text=True, timeout=15
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return HTMLResponse(result.stdout)
+        except Exception as e:
+            print(f"[REPORT] GDrive fetch failed: {e}")
 
-    return HTMLResponse(path.read_text(encoding="utf-8"))
+    raise HTTPException(404, "Report not found")
 
 
 @app.post("/slides")
@@ -1203,9 +1264,109 @@ KHÔNG thêm markdown, KHÔNG thêm giải thích ngoài HTML."""
 
 
 
+def _html_to_docx(subject: str, html_content: str) -> BytesIO:
+    """Helper: convert HTML to DOCX (runs in thread pool)."""
+    from html.parser import HTMLParser
+    doc = DocxDocument()
+
+    # Title
+    title_para = doc.add_heading(f"Phân Tích Thuế — {subject}", 0)
+    title_para.runs[0].font.color.rgb = RGBColor(0x02, 0x8a, 0x39)
+    title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    doc.add_paragraph(f"Ngày tạo: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    doc.add_paragraph("Nguồn: Perplexity Sonar + Claude AI | taxsector.gpt4vn.com")
+    doc.add_paragraph()
+
+    # Parse HTML
+    class DocxBuilder(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.current_tag = None
+            self.current_para = None
+            self.text_buf = ""
+            self.skip_tags = {"script","style","a"}
+            self.in_skip = False
+            self.in_table = False
+            self.table_rows = []
+            self.current_row = []
+            self.is_header_row = False
+
+        def handle_starttag(self, tag, attrs):
+            self.current_tag = tag
+            if tag in self.skip_tags:
+                self.in_skip = True
+            elif tag == "table":
+                self.in_table = True
+                self.table_rows = []
+            elif tag == "tr":
+                self.current_row = []
+            elif tag in ("th",):
+                self.is_header_row = True
+
+        def handle_endtag(self, tag):
+            if tag in self.skip_tags:
+                self.in_skip = False
+            elif tag in ("h2","h3","h4","p","li"):
+                t = self.text_buf.strip()
+                if t:
+                    if self.current_tag == "h2" or tag == "h2":
+                        h = doc.add_heading(t, level=1)
+                        h.runs[0].font.color.rgb = RGBColor(0x02, 0x8a, 0x39)
+                    elif tag == "h3":
+                        h = doc.add_heading(t, level=2)
+                        h.runs[0].font.color.rgb = RGBColor(0x01, 0x6d, 0x2d)
+                    elif tag == "h4":
+                        doc.add_heading(t, level=3)
+                    elif tag == "li":
+                        p = doc.add_paragraph(t, style="List Bullet")
+                        if p.runs: p.runs[0].font.size = Pt(11)
+                    else:
+                        p = doc.add_paragraph(t)
+                        if p.runs: p.runs[0].font.size = Pt(11)
+                self.text_buf = ""
+            elif tag in ("td","th"):
+                self.current_row.append(self.text_buf.strip())
+                self.text_buf = ""
+            elif tag == "tr":
+                if self.current_row:
+                    self.table_rows.append((self.current_row, self.is_header_row))
+                self.is_header_row = False
+                self.current_row = []
+            elif tag == "table":
+                self.in_table = False
+                if self.table_rows:
+                    max_cols = max(len(r[0]) for r in self.table_rows)
+                    if max_cols > 0:
+                        tbl = doc.add_table(rows=len(self.table_rows), cols=max_cols)
+                        tbl.style = "Table Grid"
+                        for ri, (row_data, is_hdr) in enumerate(self.table_rows):
+                            for ci, cell_text in enumerate(row_data[:max_cols]):
+                                cell = tbl.rows[ri].cells[ci]
+                                cell.text = cell_text
+                                if is_hdr:
+                                    for run in cell.paragraphs[0].runs:
+                                        run.font.bold = True
+                                        run.font.color.rgb = RGBColor(0x02, 0x8a, 0x39)
+                        doc.add_paragraph()
+                self.table_rows = []
+
+        def handle_data(self, data):
+            if not self.in_skip and not self.in_table or self.current_tag in ("td","th"):
+                self.text_buf += data
+
+    builder = DocxBuilder()
+    builder.feed(html_content)
+
+    buf = BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf
+
+
 @app.post("/docx")
 async def export_docx(request_body: dict, user: dict = Depends(get_current_user)):
     """Convert report HTML to DOCX and return as download."""
+    import concurrent.futures
     from fastapi.responses import Response
     html    = request_body.get("html", "")
     subject = request_body.get("subject", "Báo cáo")
@@ -1217,100 +1378,10 @@ async def export_docx(request_body: dict, user: dict = Depends(get_current_user)
         raise HTTPException(503, "BeautifulSoup không khả dụng.")
 
     try:
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(_html_to_docx, subject, html)
+            buf = future.result(timeout=30)
 
-        doc = DocxDocument()
-        # Title
-        title_para = doc.add_heading(f"Phân Tích Thuế — {subject}", 0)
-        title_para.runs[0].font.color.rgb = RGBColor(0x02, 0x8a, 0x39)
-        doc.add_paragraph(f"Ngày tạo: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
-        doc.add_paragraph("Nguồn: Perplexity Sonar + Claude AI | taxsector.gpt4vn.com")
-        doc.add_paragraph()
-
-        # Parse HTML
-        from html.parser import HTMLParser
-        class DocxBuilder(HTMLParser):
-            def __init__(self):
-                super().__init__()
-                self.current_tag = None
-                self.current_para = None
-                self.text_buf = ""
-                self.skip_tags = {"script","style","a"}
-                self.in_skip = False
-                self.in_table = False
-                self.table_rows = []
-                self.current_row = []
-                self.is_header_row = False
-
-            def handle_starttag(self, tag, attrs):
-                self.current_tag = tag
-                if tag in self.skip_tags:
-                    self.in_skip = True
-                elif tag == "table":
-                    self.in_table = True
-                    self.table_rows = []
-                elif tag == "tr":
-                    self.current_row = []
-                elif tag in ("th",):
-                    self.is_header_row = True
-
-            def handle_endtag(self, tag):
-                if tag in self.skip_tags:
-                    self.in_skip = False
-                elif tag in ("h2","h3","h4","p","li"):
-                    t = self.text_buf.strip()
-                    if t:
-                        if self.current_tag == "h2" or tag == "h2":
-                            h = doc.add_heading(t, level=1)
-                            h.runs[0].font.color.rgb = RGBColor(0x02, 0x8a, 0x39)
-                        elif tag == "h3":
-                            h = doc.add_heading(t, level=2)
-                            h.runs[0].font.color.rgb = RGBColor(0x01, 0x6d, 0x2d)
-                        elif tag == "h4":
-                            doc.add_heading(t, level=3)
-                        elif tag == "li":
-                            p = doc.add_paragraph(t, style="List Bullet")
-                            p.runs[0].font.size = Pt(11) if p.runs else None
-                        else:
-                            p = doc.add_paragraph(t)
-                            if p.runs:
-                                p.runs[0].font.size = Pt(11)
-                    self.text_buf = ""
-                elif tag in ("td","th"):
-                    self.current_row.append(self.text_buf.strip())
-                    self.text_buf = ""
-                elif tag == "tr":
-                    if self.current_row:
-                        self.table_rows.append((self.current_row, self.is_header_row))
-                    self.is_header_row = False
-                    self.current_row = []
-                elif tag == "table":
-                    self.in_table = False
-                    if self.table_rows:
-                        max_cols = max(len(r[0]) for r in self.table_rows)
-                        if max_cols > 0:
-                            tbl = doc.add_table(rows=len(self.table_rows), cols=max_cols)
-                            tbl.style = "Table Grid"
-                            for ri, (row_data, is_hdr) in enumerate(self.table_rows):
-                                for ci, cell_text in enumerate(row_data[:max_cols]):
-                                    cell = tbl.rows[ri].cells[ci]
-                                    cell.text = cell_text
-                                    if is_hdr:
-                                        for run in cell.paragraphs[0].runs:
-                                            run.font.bold = True
-                                            run.font.color.rgb = RGBColor(0x02, 0x8a, 0x39)
-                            doc.add_paragraph()
-                    self.table_rows = []
-
-            def handle_data(self, data):
-                if not self.in_skip and not self.in_table or self.current_tag in ("td","th"):
-                    self.text_buf += data
-
-        builder = DocxBuilder()
-        builder.feed(html)
-
-        buf = BytesIO()
-        doc.save(buf)
-        buf.seek(0)
         safe_name = re.sub(r'[^\w\s-]', '', subject).strip()[:40]
         filename = f"TaxReport_{safe_name}_{datetime.now().strftime('%Y%m%d')}.docx"
         return Response(
@@ -1318,10 +1389,13 @@ async def export_docx(request_body: dict, user: dict = Depends(get_current_user)
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'}
         )
+    except concurrent.futures.TimeoutError:
+        raise HTTPException(504, "Export timeout — report too large or server busy")
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(500, f"Lỗi tạo DOCX: {str(e)}")
+        print(f"[DOCX] Export error: {e}")
+        raise HTTPException(500, f"Lỗi tạo DOCX: {str(e)[:200]}")
 
 
 # ─── Frontend ─────────────────────────────────────────────────────────────────
@@ -1465,6 +1539,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <button id="tab-company" onclick="setMode('company')" class="tab-off text-sm px-4 py-2 rounded-lg font-semibold transition-colors">🏢 Phân tích công ty</button>
     </div>
 
+    <!-- Reports shortcut on main screen -->
+    <div class="mb-5">
+      <button onclick="showReports()"
+        class="w-full sm:w-auto bg-gradient-to-r from-blue-500 to-blue-600 hover:from-blue-600 hover:to-blue-700 text-white px-6 py-3 rounded-xl font-semibold text-sm shadow-lg hover:shadow-xl transition-all flex items-center justify-center gap-2">
+        📂 Báo cáo đã lưu
+        <span class="text-xs opacity-75" id="reports-count-badge"></span>
+      </button>
+    </div>
+
     <!-- Subject input -->
     <div id="subject-sector">
       <label class="block text-xs font-semibold text-gray-600 mb-1.5">Ngành / Sector</label>
@@ -1566,19 +1649,28 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </div>
 
 <!-- Reports modal -->
-<div id="reports-modal" class="hidden fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4 no-print">
-  <div class="bg-white rounded-2xl shadow-xl w-full max-w-lg max-h-[80vh] overflow-hidden flex flex-col">
-    <div class="bg-p text-white px-5 py-4 flex items-center justify-between">
-      <h2 class="font-bold">📂 Báo cáo đã lưu</h2>
-      <button onclick="closeReports()" class="text-green-200 hover:text-white text-xl leading-none">×</button>
+<div id="reports-modal" class="hidden fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4 no-print">
+  <div class="bg-white rounded-3xl shadow-2xl max-w-3xl w-full max-h-[85vh] flex flex-col">
+    <!-- Header -->
+    <div class="flex items-center justify-between p-6 border-b border-gray-200">
+      <div>
+        <h3 class="text-xl font-bold text-gray-800">📂 Báo cáo đã lưu</h3>
+        <p class="text-xs text-gray-500 mt-1">Sắp xếp từ mới nhất → cũ nhất</p>
+      </div>
+      <button onclick="closeReports()" class="text-gray-400 hover:text-gray-600 text-2xl leading-none">&times;</button>
     </div>
-    <div class="px-4 pt-3 pb-1">
-      <input type="text" id="reports-search"
-        placeholder="🔍 Tìm theo tên báo cáo..."
-        class="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-400"
-        oninput="filterReports(this.value)">
+    <!-- Search box -->
+    <div class="px-6 py-4 border-b border-gray-100">
+      <input type="text" id="reports-search" placeholder="🔍 Tìm kiếm báo cáo theo tên ngành, công ty..."
+        oninput="filterReports(this.value)"
+        class="w-full px-4 py-2.5 rounded-xl border border-gray-300 focus:border-green-500 focus:ring-2 focus:ring-green-200 outline-none text-sm transition-all">
     </div>
-    <div id="reports-list" class="flex-1 overflow-y-auto p-4 space-y-2"></div>
+    <!-- Report list (scrollable) -->
+    <div class="flex-1 overflow-y-auto p-6">
+      <div id="reports-list" class="space-y-2">
+        <p class="text-sm text-gray-400">Đang tải...</p>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -2138,6 +2230,9 @@ async function loadReportsList(showAll=false){
     const data = await resp.json();
     data.sort((a,b)=>(b.mtime||0)-(a.mtime||0));
     allReportsData = data;
+    // Update badge count on main screen button
+    const badge = document.getElementById('reports-count-badge');
+    if(badge) badge.textContent = data.length ? `(${data.length})` : '';
     renderReportList(data, showAll);
   } catch(e){ list.innerHTML=`<p class="text-sm text-red-500">Lỗi: ${e.message}</p>`; }
 }
