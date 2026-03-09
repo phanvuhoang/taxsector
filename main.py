@@ -1018,7 +1018,7 @@ async def me(user: dict = Depends(get_current_user)):
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
-async def index():
+async def index(user: dict = Depends(get_current_user)):
     return HTML_PAGE
 
 @app.post("/stream")
