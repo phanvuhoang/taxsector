@@ -47,19 +47,10 @@ except ImportError:
     PSYCOPG2_OK = False
 
 try:
-    import bcrypt as _bcrypt
-    BCRYPT_OK = True
+    from passlib.context import CryptContext
+    PASSLIB_OK = True
 except ImportError:
-    BCRYPT_OK = False
-
-def hash_password(pw: str) -> str:
-    return _bcrypt.hashpw(pw.encode(), _bcrypt.gensalt()).decode()
-
-def verify_password(pw: str, hashed: str) -> bool:
-    try:
-        return _bcrypt.checkpw(pw.encode(), hashed.encode())
-    except Exception:
-        return False
+    PASSLIB_OK = False
 
 try:
     from jose import JWTError, jwt
@@ -91,6 +82,7 @@ JWT_SECRET = os.getenv("JWT_SECRET", "sectortax-jwt-secret-change-in-prod")
 JWT_ALGORITHM    = "HS256"
 JWT_EXPIRE_HOURS = 24 * 7  # 7 days
 
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto") if PASSLIB_OK else None
 db_pool: "ThreadedConnectionPool | None" = None
 
 @app.on_event("startup")
@@ -120,7 +112,7 @@ async def startup():
 
 def _seed_admin_user():
     """Ensure admin user (hoang) exists in DB with a valid bcrypt hash."""
-    if not db_pool:
+    if not db_pool or not pwd_context:
         return
     admin_user = os.getenv("APP_USERNAME", "hoang")
     admin_pass = os.getenv("APP_PASSWORD", "taxsector2026")
@@ -130,7 +122,7 @@ def _seed_admin_user():
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM users WHERE username=%s", (admin_user,))
             if not cur.fetchone():
-                hashed = hash_password(admin_pass)
+                hashed = pwd_context.hash(admin_pass)
                 cur.execute(
                     "INSERT INTO users (username, email, password_hash, plan, is_active) "
                     "VALUES (%s, %s, %s, 'admin', true) ON CONFLICT (username) DO NOTHING",
@@ -139,8 +131,8 @@ def _seed_admin_user():
                 conn.commit()
                 print(f"[DB] Seeded admin user: {admin_user}")
             else:
-                # Rehash with native bcrypt to ensure compatibility
-                hashed = hash_password(admin_pass)
+                # Update hash in case passlib version changed
+                hashed = pwd_context.hash(admin_pass)
                 cur.execute(
                     "UPDATE users SET password_hash=%s WHERE username=%s",
                     (hashed, admin_user)
@@ -247,7 +239,12 @@ def _db_get_user_by_id(user_id: int) -> dict | None:
         release_db_conn(conn)
 
 def _verify_password(plain: str, hashed: str) -> bool:
-    return verify_password(plain, hashed)
+    if pwd_context:
+        try:
+            return pwd_context.verify(plain, hashed)
+        except Exception:
+            return False
+    return False
 
 async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
     """Validate JWT token and return user dict."""
@@ -985,10 +982,10 @@ async def register(request: Request):
     if len(password) < 6:
         raise HTTPException(400, "Mật khẩu phải ít nhất 6 ký tự")
 
-    if not db_pool:
+    if not db_pool or not pwd_context:
         raise HTTPException(503, "Đăng ký chưa khả dụng (DB chưa kết nối)")
 
-    hashed = hash_password(password)
+    hashed = pwd_context.hash(password)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
