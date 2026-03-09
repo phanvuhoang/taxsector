@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tax Sector Research Tool — Single-file FastAPI application"""
 
-import os, asyncio, json, re, io, secrets, time
+import os, asyncio, json, re, io, secrets, time, unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import AsyncGenerator
@@ -603,9 +603,17 @@ async def stream_report(request: Request, _user: str = Depends(auth)):
         unique_citations = list(dict.fromkeys(all_citations))
         full_html = linkify_citations(full_html, unique_citations)
 
-        # Save
+        # Save — append citations to report before saving
         try:
-            filename = save_report(subject, full_html)
+            if unique_urls:
+                refs_html = '<hr><h2>Nguồn tham khảo</h2><ol>'
+                for url in unique_urls[:50]:
+                    refs_html += f'<li><a href="{url}" target="_blank" rel="noopener">{url}</a></li>'
+                refs_html += '</ol>'
+                full_html_with_refs = full_html + refs_html
+            else:
+                full_html_with_refs = full_html
+            filename = save_report(subject, full_html_with_refs)
         except Exception:
             filename = None
 
@@ -694,6 +702,10 @@ def delete_report(name: str, _user: str = Depends(auth)):
     return {"ok": True}
 
 # ── DOCX export ───────────────────────────────────────────────────────────────
+def normalize_text(text: str) -> str:
+    """NFC normalize để fix lỗi latin-1 encoding trong python-docx."""
+    return unicodedata.normalize('NFC', text)
+
 @app.post("/docx")
 async def export_docx(request: Request, _user: str = Depends(auth)):
     try:
@@ -705,10 +717,13 @@ async def export_docx(request: Request, _user: str = Depends(auth)):
             raise HTTPException(400, "Nội dung báo cáo trống")
 
         doc = Document()
-        title_para = doc.add_heading(f"Phân Tích Thuế — {subject}", 0)
+        # Fix encoding: set core properties with ASCII-safe values
+        doc.core_properties.author = "Tax Sector Research"
+        doc.core_properties.title = ""
+        title_para = doc.add_heading(normalize_text(f"Phân Tích Thuế — {subject}"), 0)
         if title_para.runs:
             title_para.runs[0].font.color.rgb = RGBColor(0x02, 0x8A, 0x39)
-        doc.add_paragraph(f"Ngày tạo: {datetime.now().strftime('%d/%m/%Y')}")
+        doc.add_paragraph(normalize_text(f"Ngày tạo: {datetime.now().strftime('%d/%m/%Y')}"))
 
         soup = BeautifulSoup(html, "html.parser")
         for tag in soup.find_all(["a", "strong", "em", "span", "b", "i"]):
@@ -717,7 +732,7 @@ async def export_docx(request: Request, _user: str = Depends(auth)):
 
         for el in soup.find_all(["h2", "h3", "p", "li", "table"]):
             try:
-                text = " ".join(el.get_text(" ", strip=False).split())
+                text = normalize_text(" ".join(el.get_text(" ", strip=False).split()))
                 if not text:
                     continue
                 tag = el.name
@@ -1331,6 +1346,25 @@ async function suggestSubs(secId) {
     suggestions.forEach(sg => { if (!s.sub.includes(sg)) s.sub.push(sg); });
     renderSections();
   }
+}
+
+function buildRefsHtml() {
+  const srcList = document.getElementById('src-list');
+  if (!srcList) return '';
+  const items = srcList.querySelectorAll('a, li');
+  if (!items.length) return '';
+  let html = '<h2>Nguồn tham khảo</h2><ol>';
+  items.forEach(el => {
+    const a = el.tagName === 'A' ? el : el.querySelector('a');
+    if (a) {
+      html += `<li><a href="${a.href}" target="_blank">${a.textContent.trim()}</a></li>`;
+    } else {
+      const t = el.textContent.trim();
+      if (t) html += `<li>${t}</li>`;
+    }
+  });
+  html += '</ol>';
+  return html;
 }
 
 // ── Research ──────────────────────────────────────────────────
