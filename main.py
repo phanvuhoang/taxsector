@@ -656,64 +656,6 @@ async def suggest_subsections(request: Request, _user: str = Depends(auth)):
         suggestions = []
     return {"suggestions": suggestions}
 
-# ── AI Section Recommender ────────────────────────────────────────────────────
-@app.post("/recommend-sections")
-async def recommend_sections(request: Request, _user: str = Depends(auth)):
-    body    = await request.json()
-    subject = body.get("subject", "").strip()
-    mode    = body.get("mode", "sector")
-
-    if not subject:
-        raise HTTPException(400, "Missing subject")
-    if not ANTHROPIC_KEY:
-        return {"sections": SECTOR_SECTIONS_VI if mode == "sector" else COMPANY_SECTIONS_VI}
-
-    mode_ctx = "ngành/lĩnh vực" if mode == "sector" else "công ty"
-    prompt = f"""Bạn là chuyên gia tư vấn thuế Big 4 (Deloitte/PwC/EY/KPMG) với 20 năm kinh nghiệm.
-
-Nhà tư vấn thuế cần nghiên cứu về {mode_ctx}: **{subject}**
-
-Hãy đề xuất cấu trúc báo cáo phân tích thuế TỐI ƯU cho đối tượng này.
-Dựa trên đặc thù của {subject}, hãy:
-1. Xác định các section quan trọng nhất (5-8 section)
-2. Với mỗi section, liệt kê 4-6 sub-items CỤ THỂ cho {subject} (không chung chung)
-3. Đặc biệt chú ý các vấn đề thuế đặc thù, rủi ro cao, hoặc quy định mới nhất cho ngành/công ty này
-
-Trả về JSON ARRAY theo format sau, KHÔNG giải thích thêm:
-[
-  {{
-    "id": "s1",
-    "title": "Tên section tiếng Việt",
-    "sub": ["sub-item 1 cụ thể", "sub-item 2 cụ thể"],
-    "enabled": true
-  }}
-]
-
-Chỉ trả về JSON array, bắt đầu bằng [ và kết thúc bằng ]."""
-
-    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
-    try:
-        msg = await client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=2000,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        content = msg.content[0].text.strip()
-        match = re.search(r'\[.*\]', content, re.DOTALL)
-        if match:
-            sections = json.loads(match.group())
-            for i, s in enumerate(sections):
-                if "id" not in s:
-                    s["id"] = f"r{i+1}"
-                if "enabled" not in s:
-                    s["enabled"] = True
-            return {"sections": sections, "ai_recommended": True}
-        else:
-            return {"sections": SECTOR_SECTIONS_VI if mode == "sector" else COMPANY_SECTIONS_VI}
-    except Exception as e:
-        return {"sections": SECTOR_SECTIONS_VI if mode == "sector" else COMPANY_SECTIONS_VI,
-                "error": str(e)}
-
 # ── Reports ───────────────────────────────────────────────────────────────────
 @app.get("/reports")
 def list_reports(_user: str = Depends(auth)):
@@ -754,61 +696,81 @@ def delete_report(name: str, _user: str = Depends(auth)):
 # ── DOCX export ───────────────────────────────────────────────────────────────
 @app.post("/docx")
 async def export_docx(request: Request, _user: str = Depends(auth)):
-    body    = await request.json()
-    html    = body.get("html", "")
-    subject = body.get("subject", "Báo cáo")
+    try:
+        body    = await request.json()
+        html    = body.get("html", "")
+        subject = body.get("subject", "Báo cáo")
 
-    doc = Document()
-    title_para = doc.add_heading(f"Phân Tích Thuế — {subject}", 0)
-    if title_para.runs:
-        title_para.runs[0].font.color.rgb = RGBColor(0x02, 0x8A, 0x39)
-    doc.add_paragraph(f"Ngày tạo: {datetime.now().strftime('%d/%m/%Y')}")
+        if not html.strip():
+            raise HTTPException(400, "Nội dung báo cáo trống")
 
-    soup = BeautifulSoup(html, "html.parser")
-    # Insert spaces around inline tags to prevent word merging
-    for tag in soup.find_all(["a", "strong", "em", "span", "b", "i"]):
-        tag.insert_before(" ")
-        tag.insert_after(" ")
-    for el in soup.find_all(["h2", "h3", "p", "li", "table"]):
-        text = " ".join(el.get_text(" ", strip=False).split())  # normalize whitespace
-        if not text:
-            continue
-        tag = el.name
-        if tag == "h2":
-            p = doc.add_heading(text, level=1)
-            if p.runs:
-                p.runs[0].font.color.rgb = RGBColor(0x02, 0x8A, 0x39)
-        elif tag == "h3":
-            doc.add_heading(text, level=2)
-        elif tag == "p":
-            doc.add_paragraph(text)
-        elif tag == "li":
-            doc.add_paragraph(text, style="List Bullet")
-        elif tag == "table":
-            rows = el.find_all("tr")
-            if not rows:
+        doc = Document()
+        title_para = doc.add_heading(f"Phân Tích Thuế — {subject}", 0)
+        if title_para.runs:
+            title_para.runs[0].font.color.rgb = RGBColor(0x02, 0x8A, 0x39)
+        doc.add_paragraph(f"Ngày tạo: {datetime.now().strftime('%d/%m/%Y')}")
+
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup.find_all(["a", "strong", "em", "span", "b", "i"]):
+            tag.insert_before(" ")
+            tag.insert_after(" ")
+
+        for el in soup.find_all(["h2", "h3", "p", "li", "table"]):
+            try:
+                text = " ".join(el.get_text(" ", strip=False).split())
+                if not text:
+                    continue
+                tag = el.name
+                if tag == "h2":
+                    p = doc.add_heading(text, level=1)
+                    if p.runs:
+                        p.runs[0].font.color.rgb = RGBColor(0x02, 0x8A, 0x39)
+                elif tag == "h3":
+                    doc.add_heading(text, level=2)
+                elif tag == "p":
+                    doc.add_paragraph(text)
+                elif tag == "li":
+                    try:
+                        doc.add_paragraph(text, style="List Bullet")
+                    except KeyError:
+                        doc.add_paragraph(f"• {text}")
+                elif tag == "table":
+                    rows = el.find_all("tr")
+                    if not rows:
+                        continue
+                    cols = max(len(r.find_all(["th", "td"])) for r in rows)
+                    if cols == 0:
+                        continue
+                    t = doc.add_table(rows=0, cols=cols)
+                    try:
+                        t.style = "Table Grid"
+                    except KeyError:
+                        pass
+                    for row in rows:
+                        cells = row.find_all(["th", "td"])
+                        row_cells = t.add_row().cells
+                        for j, cell in enumerate(cells[:cols]):
+                            row_cells[j].text = cell.get_text(strip=True)
+            except Exception as el_err:
+                print(f"[DOCX] Skip element {el.name}: {el_err}")
                 continue
-            cols = max(len(r.find_all(["th", "td"])) for r in rows)
-            if cols == 0:
-                continue
-            t = doc.add_table(rows=0, cols=cols)
-            t.style = "Table Grid"
-            for row in rows:
-                cells = row.find_all(["th", "td"])
-                row_cells = t.add_row().cells
-                for j, cell in enumerate(cells[:cols]):
-                    row_cells[j].text = cell.get_text(strip=True)
 
-    buf = io.BytesIO()
-    doc.save(buf)
-    buf.seek(0)
+        buf = io.BytesIO()
+        doc.save(buf)
+        buf.seek(0)
 
-    safe = re.sub(r'[^\w\s-]', '', subject)[:50].strip().replace(' ', '_')
-    return StreamingResponse(
-        buf,
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={"Content-Disposition": f'attachment; filename="PhanTichThue_{safe}.docx"'},
-    )
+        safe = re.sub(r'[^\w\s-]', '', subject)[:50].strip().replace(' ', '_')
+        return StreamingResponse(
+            buf,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={"Content-Disposition": f'attachment; filename="PhanTichThue_{safe}.docx"'},
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[DOCX] Export failed: {e}")
+        raise HTTPException(500, f"Xuất DOCX thất bại: {str(e)[:200]}")
 
 # ── PPTX export ───────────────────────────────────────────────────────────────
 @app.post("/slides")
@@ -1068,6 +1030,15 @@ body.dark .sec-card input[type=text]{background:transparent}
       </button>
     </div>
 
+    <!-- Reports shortcut -->
+    <div class="mt-4 text-center">
+      <button onclick="openReports()"
+        class="btn btn-gray text-sm px-5 py-2">
+        📂 Báo cáo đã lưu
+        <span id="reports-badge" class="ml-1 text-xs opacity-60"></span>
+      </button>
+    </div>
+
     <!-- Subject input -->
     <div class="surface rounded-xl p-5 mb-4 shadow-sm">
       <label id="subj-label" class="block text-sm font-medium mb-2">Tên ngành / lĩnh vực:</label>
@@ -1083,15 +1054,6 @@ body.dark .sec-card input[type=text]{background:transparent}
         <label class="flex items-center gap-1.5 cursor-pointer text-sm">
           <input type="radio" name="sonar" value="sonar-pro" class="accent-green-600"> Sonar Pro (sâu)
         </label>
-      </div>
-      <div class="mt-3 flex items-center gap-3">
-        <button id="btn-recommend" onclick="aiRecommend()"
-          class="btn btn-green text-sm">
-          ✨ AI Gợi ý cấu trúc cho chủ đề này
-        </button>
-        <span id="recommend-hint" class="text-xs" style="color:var(--muted)">
-          Nhập tên ngành/công ty rồi bấm để AI đề xuất sections phù hợp
-        </span>
       </div>
     </div>
 
@@ -1185,13 +1147,26 @@ body.dark .sec-card input[type=text]{background:transparent}
 
 <!-- ── Reports Modal ─────────────────────────────────────────── -->
 <div id="modal-reports" class="fixed inset-0 bg-black/50 z-50 hidden flex items-center justify-center">
-  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-xl mx-4 max-h-[80vh] flex flex-col"
+  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-xl mx-4 max-h-[85vh] flex flex-col"
        style="background:var(--surface);color:var(--text)">
+    <!-- Header -->
     <div class="p-5 border-b flex items-center justify-between" style="border-color:var(--border)">
-      <h2 class="font-bold">📂 Báo cáo đã lưu</h2>
+      <div>
+        <h2 class="font-bold text-lg">📂 Báo cáo đã lưu</h2>
+        <p class="text-xs mt-0.5" style="color:var(--muted)">Mới nhất → cũ nhất</p>
+      </div>
       <button onclick="closeModal('modal-reports')" class="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
     </div>
-    <div id="reports-list" class="flex-1 overflow-y-auto p-4 space-y-2"></div>
+    <!-- Search box -->
+    <div class="px-4 pt-3 pb-2">
+      <input type="text" id="reports-search"
+        placeholder="🔍 Tìm kiếm theo tên báo cáo..."
+        oninput="filterReports(this.value)"
+        class="w-full px-3 py-2 text-sm rounded-lg border focus:outline-none focus:ring-2"
+        style="border-color:var(--border);background:var(--bg);color:var(--text);--tw-ring-color:var(--accent)">
+    </div>
+    <!-- List -->
+    <div id="reports-list" class="flex-1 overflow-y-auto px-4 pb-4 space-y-2"></div>
   </div>
 </div>
 
@@ -1218,6 +1193,13 @@ async function doLogin() {
     if (r.ok) {
       document.getElementById('login-modal').classList.add('hidden');
       init();
+      // Load reports count for badge
+      fetch('/reports', {headers: {Authorization: AUTH}})
+        .then(r => r.json())
+        .then(data => {
+          const badge = document.getElementById('reports-badge');
+          if (badge) badge.textContent = data.length ? `(${data.length})` : '';
+        }).catch(() => {});
     } else {
       document.getElementById('li-err').classList.remove('hidden');
       AUTH = '';
@@ -1352,43 +1334,6 @@ async function suggestSubs(secId) {
 }
 
 // ── Research ──────────────────────────────────────────────────
-async function aiRecommend() {
-  const subject = document.getElementById('subj-input').value.trim();
-  if (!subject) {
-    alert('Vui lòng nhập tên ngành hoặc công ty trước');
-    return;
-  }
-  const btn = document.getElementById('btn-recommend');
-  const hint = document.getElementById('recommend-hint');
-  btn.textContent = '⏳ AI đang phân tích...';
-  btn.disabled = true;
-  hint.textContent = 'Đang gợi ý sections phù hợp với ' + subject + '...';
-
-  try {
-    const r = await fetch('/recommend-sections', {
-      method: 'POST',
-      headers: {Authorization: AUTH, 'Content-Type': 'application/json'},
-      body: JSON.stringify({subject, mode}),
-    });
-    if (r.ok) {
-      const data = await r.json();
-      if (data.sections && data.sections.length) {
-        sections = data.sections;
-        renderSections();
-        hint.textContent = data.ai_recommended
-          ? `✅ AI đã đề xuất ${data.sections.length} sections tối ưu cho "${subject}"`
-          : '⚠️ Dùng sections mặc định (AI không khả dụng)';
-      }
-    } else {
-      hint.textContent = 'Không thể lấy gợi ý — dùng sections mặc định';
-    }
-  } catch(e) {
-    hint.textContent = 'Lỗi: ' + e.message;
-  } finally {
-    btn.textContent = '✨ AI Gợi ý cấu trúc cho chủ đề này';
-    btn.disabled = false;
-  }
-}
 
 async function startResearch() {
   const subject = document.getElementById('subj-input').value.trim();
@@ -1599,63 +1544,113 @@ async function doSlides() {
 }
 
 async function doDocx() {
-  if (!reportHtml) return;
-  const subject = document.getElementById('rpt-title').textContent.replace('Phân Tích Thuế — ', '');
   const btn = document.getElementById('btn-docx');
-  btn.textContent = '⏳ Đang xuất...';
-  btn.disabled = true;
+  if (!reportHtml) { alert('Chưa có báo cáo để xuất'); return; }
+  const originalText = btn ? btn.textContent : '';
+  if (btn) { btn.textContent = '⏳ Đang xuất...'; btn.disabled = true; }
   try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 60000);
     const r = await fetch('/docx', {
       method: 'POST',
       headers: {Authorization: AUTH, 'Content-Type': 'application/json'},
-      body: JSON.stringify({html: reportHtml, subject}),
+      body: JSON.stringify({
+        html: reportHtml,
+        subject: document.getElementById('rpt-title')?.textContent || 'Báo cáo'
+      }),
+      signal: controller.signal,
     });
-    if (r.ok) {
-      const blob = await r.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = (currentFile || subject).replace('.html', '') + '.docx';
-      a.click();
-      URL.revokeObjectURL(url);
-    } else {
-      alert('Không thể xuất Word');
+    clearTimeout(timeoutId);
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({detail: 'Lỗi không xác định'}));
+      throw new Error(err.detail || `HTTP ${r.status}`);
     }
-  } catch(e) { alert('Lỗi: ' + e.message); }
-  finally { btn.textContent = '📄 Word'; btn.disabled = false; }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `PhanTichThue_${(document.getElementById('rpt-title')?.textContent || 'BaoCao').replace(/\s+/g,'_').slice(0,50)}.docx`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  } catch(e) {
+    if (e.name === 'AbortError') {
+      alert('Xuất DOCX quá thời gian (60s). Báo cáo có thể quá dài — thử lại hoặc rút ngắn nội dung.');
+    } else {
+      alert('Xuất DOCX thất bại: ' + e.message);
+    }
+  } finally {
+    if (btn) { btn.textContent = originalText; btn.disabled = false; }
+  }
 }
 
 // ── Reports modal ─────────────────────────────────────────────
+
 async function openReports() {
   openModal('modal-reports');
   const list = document.getElementById('reports-list');
   list.innerHTML = '<p class="text-sm text-center py-4" style="color:var(--muted)">Đang tải...</p>';
+  const searchEl = document.getElementById('reports-search');
+  if (searchEl) searchEl.value = '';
   try {
     const r = await fetch('/reports', {headers: {Authorization: AUTH}});
-    const rpts = await r.json();
-    if (!rpts.length) {
-      list.innerHTML = '<p class="text-sm text-center py-4" style="color:var(--muted)">Chưa có báo cáo nào</p>';
-      return;
-    }
-    list.innerHTML = '';
-    rpts.forEach(rpt => {
-      const div = document.createElement('div');
-      div.className = 'flex items-center gap-2 p-3 rounded-lg border fade-in';
-      div.style.borderColor = 'var(--border)';
-      div.innerHTML = `
-        <div class="flex-1 min-w-0">
-          <p class="font-medium text-sm truncate">${esc(rpt.name)}</p>
-          <p class="text-xs" style="color:var(--muted)">${rpt.date} · ${rpt.size}</p>
-        </div>
-        <button onclick="loadSavedReport('${esc(rpt.name)}')" class="btn btn-green text-xs shrink-0">📂 Mở</button>
-        <a href="/report/${encodeURIComponent(rpt.name)}" target="_blank"
-           class="btn btn-gray text-xs shrink-0">↗</a>
-        <button onclick="delReport('${esc(rpt.name)}',this)" class="btn text-xs shrink-0 text-red-400 hover:bg-red-50">🗑</button>`;
-      list.appendChild(div);
-    });
+    if (!r.ok) throw new Error('Lỗi tải danh sách');
+    const data = await r.json();
+    allReports = data.sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
+    const badge = document.getElementById('reports-badge');
+    if (badge) badge.textContent = allReports.length ? `(${allReports.length})` : '';
+    renderReports(allReports, false);
   } catch(e) {
-    list.innerHTML = '<p class="text-sm text-center py-4 text-red-500">Lỗi tải danh sách</p>';
+    list.innerHTML = `<p class="text-sm text-center py-4 text-red-500">Lỗi: ${e.message}</p>`;
   }
+}
+
+function renderReports(list, showAll) {
+  const container = document.getElementById('reports-list');
+  if (!list.length) {
+    container.innerHTML = '<p class="text-sm py-4 text-center" style="color:var(--muted)">Chưa có báo cáo nào</p>';
+    return;
+  }
+  const LIMIT = 10;
+  const displayed = showAll ? list : list.slice(0, LIMIT);
+  const remaining = list.length - LIMIT;
+  let html = displayed.map(f => {
+    const name = f.name || f;
+    const subject = f.subject || esc(name.replace('.html',''));
+    const date = f.mtime ? new Date(f.mtime * 1000).toLocaleDateString('vi-VN', {
+      day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit'
+    }) : (f.date || '');
+    const size = f.size ? (f.size > 1024*1024 ? (f.size/1024/1024).toFixed(1)+'MB' : Math.round(f.size/1024)+'KB') : '';
+    return `
+      <div class="flex items-center gap-2 p-3 rounded-lg border fade-in group" style="border-color:var(--border)">
+        <span class="text-base shrink-0">📄</span>
+        <div class="flex-1 min-w-0 cursor-pointer" onclick="loadSavedReport('${esc(name)}')">
+          <p class="font-medium text-sm truncate">${subject}</p>
+          ${date ? `<p class="text-xs" style="color:var(--muted)">${date}${size ? ' · '+size : ''}</p>` : ''}
+        </div>
+        <button onclick="loadSavedReport('${esc(name)}')" class="btn btn-green text-xs shrink-0">📂 Mở</button>
+        <a href="/report/${encodeURIComponent(name)}" target="_blank" class="btn btn-gray text-xs shrink-0">↗</a>
+        <button onclick="delReport('${esc(name)}',this)" class="btn text-xs shrink-0 text-red-400 hover:bg-red-50">🗑</button>
+      </div>`;
+  }).join('');
+  if (!showAll && remaining > 0) {
+    html += `<button onclick="renderReports(allReports, true)"
+      class="w-full mt-2 py-2 text-sm rounded-lg border" style="border-color:var(--border);color:var(--accent)">
+      ↓ Xem thêm ${remaining} báo cáo</button>`;
+  }
+  container.innerHTML = html;
+}
+
+function filterReports(query) {
+  const q = query.toLowerCase().trim();
+  if (!q) { renderReports(allReports, false); return; }
+  const filtered = allReports.filter(f => {
+    const name = (f.name || f).toLowerCase();
+    const subject = (f.subject || '').toLowerCase();
+    return name.includes(q) || subject.includes(q);
+  });
+  renderReports(filtered, true);
 }
 
 async function loadSavedReport(name) {
