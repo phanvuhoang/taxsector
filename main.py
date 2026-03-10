@@ -12,7 +12,7 @@ from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, FileResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from docx import Document
-from docx.shared import RGBColor
+from docx.shared import RGBColor, Pt
 from bs4 import BeautifulSoup
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -570,7 +570,7 @@ async def create_gamma_slides(subject: str, html_content: str) -> dict:
 
     async with _aiohttp.ClientSession() as session:
         async with session.post(GAMMA_API_URL, json=payload, headers=headers) as resp:
-            if resp.status != 200:
+            if resp.status not in (200, 201):
                 text = await resp.text()
                 raise Exception(f"Gamma API error {resp.status}: {text}")
             data = await resp.json()
@@ -754,15 +754,7 @@ async def stream_report(request: Request, _user: str = Depends(auth)):
 
         # Save — append citations to report before saving
         try:
-            if unique_urls:
-                refs_html = '<hr><h2>Nguồn tham khảo</h2><div style="margin-top:.75rem">'
-                for i, url in enumerate(unique_urls[:50], 1):
-                    short = (url[:80] + '...') if len(url) > 80 else url
-                    refs_html += f'<div style="margin:.3rem 0;font-size:.875rem"><b>[{i}]</b> <a href="{url}" target="_blank" rel="noopener" style="color:#028a39">{short}</a></div>'
-                refs_html += '</div>'
-                full_html_with_refs = full_html + refs_html
-            else:
-                full_html_with_refs = full_html
+            full_html_with_refs = full_html
             full_html_with_refs = await verify_legal_refs(full_html_with_refs)
             filename = save_report(subject, full_html_with_refs, citations=unique_citations)
         except Exception:
@@ -851,14 +843,6 @@ async def run_generate_job(job_id: str, subject: str, mode: str, sections_list: 
         unique_citations = list(dict.fromkeys(all_citations))
         full_html = "\n".join(all_html_parts)
         full_html = linkify_citations(full_html, unique_citations)
-
-        if unique_citations:
-            refs_html = '<hr><h2>Nguồn tham khảo</h2><div style="margin-top:.75rem">'
-            for i, url in enumerate(unique_citations[:50], 1):
-                short = (url[:80] + '...') if len(url) > 80 else url
-                refs_html += f'<div style="margin:.3rem 0;font-size:.875rem"><b>[{i}]</b> <a href="{url}" target="_blank" rel="noopener" style="color:#028a39">{short}</a></div>'
-            refs_html += '</div>'
-            full_html = full_html + refs_html
 
         full_html = await verify_legal_refs(full_html)
 
@@ -1071,9 +1055,10 @@ async def verify_legal_refs(html: str) -> str:
 @app.post("/docx")
 async def export_docx(request: Request, _user: str = Depends(auth)):
     try:
-        body    = await request.json()
-        html    = body.get("html", "")
-        subject = body.get("subject", "Báo cáo")
+        body      = await request.json()
+        html      = body.get("html", "")
+        subject   = body.get("subject", "Báo cáo")
+        refs_raw  = body.get("citations", [])
 
         if not html.strip():
             raise HTTPException(400, "Nội dung báo cáo trống")
@@ -1134,6 +1119,18 @@ async def export_docx(request: Request, _user: str = Depends(auth)):
             except Exception as el_err:
                 print(f"[DOCX] Skip element {el.name}: {el_err}")
                 continue
+
+        # ── Thêm Nguồn tham khảo vào cuối Word doc ────────────
+        if refs_raw:
+            doc.add_heading(normalize_text("Nguồn tham khảo"), level=1)
+            for i, url in enumerate(refs_raw[:50], 1):
+                try:
+                    p = doc.add_paragraph(style="List Number")
+                    run = p.add_run(normalize_text(url))
+                    run.font.color.rgb = RGBColor(0x02, 0x8A, 0x39)
+                    run.font.size = Pt(9)
+                except Exception:
+                    doc.add_paragraph(normalize_text(f"[{i}] {url}"))
 
         buf = io.BytesIO()
         doc.save(buf)
@@ -1967,7 +1964,8 @@ async function doDocx() {
       headers: {Authorization: AUTH, 'Content-Type': 'application/json'},
       body: JSON.stringify({
         html: reportHtml,
-        subject: document.getElementById('rpt-title')?.textContent || 'Báo cáo'
+        subject: document.getElementById('rpt-title')?.textContent || 'Báo cáo',
+        citations: citations,
       }),
       signal: controller.signal,
     });
