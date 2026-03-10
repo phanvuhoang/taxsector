@@ -454,7 +454,7 @@ def make_append_filename(original_filename: str) -> str:
     return base + '.html'
 
 
-def save_report(subject: str, html_content: str, filename_override: str = None) -> str:
+def save_report(subject: str, html_content: str, citations: list = None, filename_override: str = None) -> str:
     now = datetime.now()
     if filename_override:
         name = filename_override
@@ -467,6 +467,11 @@ def save_report(subject: str, html_content: str, filename_override: str = None) 
     # Handle rare collision (same subject, same minute)
     if not filename_override and (REPORTS_DIR / name).exists():
         name = f"{now.strftime('%d%m%Y')} - {safe_filename(subject)} - {now.strftime('%H%M%S')}.html"
+
+    citations_script = ""
+    if citations:
+        citations_json = json.dumps([c for c in citations if c], ensure_ascii=False)
+        citations_script = f'<script id="report-citations" type="application/json">{citations_json}</script>\n'
 
     full_html = f"""<!DOCTYPE html>
 <html lang="vi">
@@ -488,7 +493,7 @@ li{{margin:.25rem 0}}
 p{{margin:.6rem 0}}
 @media print{{body{{max-width:100%}}}}
 </style>
-</head>
+{citations_script}</head>
 <body>
 <h1>Phan Tich Thue — {subject}</h1>
 <p><em>Ngay tao: {now.strftime("%d/%m/%Y %H:%M")}</em></p>
@@ -644,7 +649,7 @@ async def stream_report(request: Request, _user: str = Depends(auth)):
             else:
                 full_html_with_refs = full_html
             full_html_with_refs = await verify_legal_refs(full_html_with_refs)
-            filename = save_report(subject, full_html_with_refs)
+            filename = save_report(subject, full_html_with_refs, citations=unique_citations)
         except Exception:
             filename = None
 
@@ -744,7 +749,7 @@ async def run_generate_job(job_id: str, subject: str, mode: str, sections_list: 
         job["progress"] = 97
         job["message"] = "💾 Đang lưu báo cáo..."
 
-        filename = save_report(subject, full_html)
+        filename = save_report(subject, full_html, citations=unique_citations)
 
         job["status"] = "done"
         job["progress"] = 100
@@ -1221,7 +1226,7 @@ async def run_append_job(job_id: str, subject: str, mode: str,
 
         combined_html = original_content + "\n" + appended_html if original_content else appended_html
         new_filename = make_append_filename(original_file) if original_file else None
-        filename = save_report(subject, combined_html, filename_override=new_filename)
+        filename = save_report(subject, combined_html, citations=unique_citations, filename_override=new_filename)
 
         job["status"] = "done"
         job["progress"] = 100
@@ -1792,8 +1797,11 @@ function toggleDark() {
 }
 
 async function doSlides() {
-  if (!reportHtml) return;
-  const subject = document.getElementById('rpt-title').textContent.replace('Phân Tích Thuế — ', '');
+  if (!reportHtml) { alert('Chưa có báo cáo để xuất'); return; }
+  const subject =
+    document.getElementById('rpt-title')?.textContent?.replace('Phân Tích Thuế — ', '').trim() ||
+    currentFile?.replace('.html', '').replace(/-\d{8}-\d{4}(-a\d+)?$/, '').trim() ||
+    'BaoCao';
   const btn = document.getElementById('btn-slides');
   btn.textContent = '⏳ Đang tạo PPTX...';
   btn.disabled = true;
@@ -1812,9 +1820,10 @@ async function doSlides() {
       a.click();
       URL.revokeObjectURL(url);
     } else {
-      alert('Không thể tạo PPTX');
+      const errText = await r.text().catch(() => 'Unknown error');
+      alert('Không xuất được PPTX: ' + errText);
     }
-  } catch(e) { alert('Lỗi: ' + e.message); }
+  } catch(e) { alert('Lỗi kết nối: ' + e.message); }
   finally { btn.textContent = '📑 Slides PPTX'; btn.disabled = false; }
 }
 
@@ -1928,6 +1937,21 @@ function filterReports(query) {
   renderReports(filtered, true);
 }
 
+function restoreCitations(html) {
+  const match = html.match(/<script id="report-citations" type="application\/json">([\s\S]*?)<\/script>/);
+  if (match) {
+    try { citations = JSON.parse(match[1]); } catch(e) { citations = []; }
+  } else {
+    // Fallback: extract URLs from <a href> in the report
+    citations = [];
+    const urlMatches = html.matchAll(/href="(https?:\/\/[^"]+)"/g);
+    const seen = new Set();
+    for (const m of urlMatches) {
+      if (!seen.has(m[1])) { seen.add(m[1]); citations.push(m[1]); }
+    }
+  }
+}
+
 async function loadSavedReport(name) {
   closeModal('modal-reports');
   try {
@@ -1938,7 +1962,9 @@ async function loadSavedReport(name) {
     const body = doc.getElementById('report-body');
     reportHtml = body ? body.innerHTML : doc.body.innerHTML;
     currentFile = name;
-    citations = [];
+
+    // Restore citations from embedded JSON or fallback
+    restoreCitations(html);
 
     // Try to extract title
     const h1 = doc.querySelector('h1');
@@ -1952,6 +1978,7 @@ async function loadSavedReport(name) {
     document.getElementById('toc-wrap').classList.add('hidden');
     document.getElementById('src-wrap').classList.add('hidden');
     buildTOC();
+    buildSources();
     setupScroll();
     window.scrollTo({top: 0, behavior: 'smooth'});
   } catch(e) { alert('Không thể tải báo cáo: ' + e.message); }
