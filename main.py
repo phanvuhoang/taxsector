@@ -720,6 +720,9 @@ async def export_docx(request: Request, _user: str = Depends(auth)):
         # Fix encoding: set core properties with ASCII-safe values
         doc.core_properties.author = "Tax Sector Research"
         doc.core_properties.title = ""
+        doc.core_properties.subject = ""
+        doc.core_properties.keywords = ""
+        doc.core_properties.description = ""
         title_para = doc.add_heading(normalize_text(f"Phân Tích Thuế — {subject}"), 0)
         if title_para.runs:
             title_para.runs[0].font.color.rgb = RGBColor(0x02, 0x8A, 0x39)
@@ -765,7 +768,7 @@ async def export_docx(request: Request, _user: str = Depends(auth)):
                         cells = row.find_all(["th", "td"])
                         row_cells = t.add_row().cells
                         for j, cell in enumerate(cells[:cols]):
-                            row_cells[j].text = cell.get_text(strip=True)
+                            row_cells[j].text = normalize_text(cell.get_text(strip=True))
             except Exception as el_err:
                 print(f"[DOCX] Skip element {el.name}: {el_err}")
                 continue
