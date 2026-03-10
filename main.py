@@ -1751,19 +1751,25 @@ function buildTOC() {
 
 // ── Sources ───────────────────────────────────────────────────
 function buildSources() {
-  const unique = [...new Set(citations)];
-  if (!unique.length) return;
+  const unique = [...new Set(citations.filter(u => u && u.startsWith('http')))];
+  if (!unique.length) {
+    document.getElementById('src-wrap')?.classList.add('hidden');
+    return;
+  }
   const list = document.getElementById('src-list');
   list.innerHTML = '';
   unique.forEach((url, i) => {
     const d = document.createElement('div');
-    d.className = 'text-xs';
+    d.className = 'text-xs mb-1';
     d.style.color = 'var(--muted)';
-    d.innerHTML = `[${i+1}] <a href="${esc(url)}" target="_blank" class="hover:underline" style="color:var(--brand)">${esc(url)}</a>`;
+    let displayUrl = url;
+    try { displayUrl = new URL(url).hostname + new URL(url).pathname.slice(0, 40); } catch(e) {}
+    d.innerHTML = `<span style="color:var(--text);font-weight:600">[${i+1}]</span> `
+      + `<a href="${esc(url)}" target="_blank" rel="noopener" class="hover:underline" style="color:var(--brand)">${esc(displayUrl)}</a>`;
     list.appendChild(d);
   });
   document.getElementById('src-count').textContent = unique.length;
-  document.getElementById('src-wrap').classList.remove('hidden');
+  document.getElementById('src-wrap')?.classList.remove('hidden');
 }
 
 function toggleSrc() {
@@ -1799,8 +1805,8 @@ function toggleDark() {
 async function doSlides() {
   if (!reportHtml) { alert('Chưa có báo cáo để xuất'); return; }
   const subject =
-    document.getElementById('rpt-title')?.textContent?.replace('Phân Tích Thuế — ', '').trim() ||
-    currentFile?.replace('.html', '').replace(/-\d{8}-\d{4}(-a\d+)?$/, '').trim() ||
+    document.getElementById('rpt-title')?.textContent?.replace('Phân Tích Thuế —', '').trim() ||
+    (currentFile || '').replace('.html', '').replace(/-a\d+$/, '').replace(/-\d{8}-?\d{0,4}$/, '').trim() ||
     'BaoCao';
   const btn = document.getElementById('btn-slides');
   btn.textContent = '⏳ Đang tạo PPTX...';
@@ -1808,8 +1814,8 @@ async function doSlides() {
   try {
     const r = await fetch('/slides', {
       method: 'POST',
-      headers: {Authorization: AUTH, 'Content-Type': 'application/json'},
-      body: JSON.stringify({html: reportHtml, subject}),
+      headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ html: reportHtml, subject }),
     });
     if (r.ok) {
       const blob = await r.blob();
@@ -1817,14 +1823,20 @@ async function doSlides() {
       const a = document.createElement('a');
       a.href = url;
       a.download = (currentFile || subject).replace('.html', '') + '.pptx';
+      document.body.appendChild(a);
       a.click();
+      document.body.removeChild(a);
       URL.revokeObjectURL(url);
     } else {
-      const errText = await r.text().catch(() => 'Unknown error');
+      const errText = await r.text().catch(() => 'Lỗi không xác định');
       alert('Không xuất được PPTX: ' + errText);
     }
-  } catch(e) { alert('Lỗi kết nối: ' + e.message); }
-  finally { btn.textContent = '📑 Slides PPTX'; btn.disabled = false; }
+  } catch(e) {
+    alert('Lỗi kết nối: ' + e.message);
+  } finally {
+    btn.textContent = '📑 Slides PPTX';
+    btn.disabled = false;
+  }
 }
 
 async function doDocx() {
