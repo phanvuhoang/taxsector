@@ -113,7 +113,11 @@ def build_query(section: dict, subject: str, mode: str) -> str:
     if mode == "company":
         subject_ctx = f"{subject} (phân tích thuế doanh nghiệp)"
 
-    subs = ", ".join(section.get("sub", []))
+    raw_subs = section.get("sub", [])
+    subs = ", ".join(
+        s["title"] if isinstance(s, dict) else s
+        for s in raw_subs
+    )
     title_lower = section.get("title", "").lower()
     is_legal = any(k in title_lower for k in [
         "pháp lý","luật","quy định","thuế","thue","tài chính","rủi ro","tranh chấp"
@@ -341,7 +345,11 @@ def filter_context(all_results: dict, section: dict) -> str:
 # ── Claude per-section streaming ──────────────────────────────────────────────
 def build_section_prompt(section: dict, subject: str, context: str, mode: str, num: int) -> str:
     mode_ctx = "ngành" if mode == "sector" else "công ty"
-    sub_list = "\n".join(f"- {s}" for s in section.get("sub", []))
+    raw_subs = section.get("sub", [])
+    sub_list = "\n".join(
+        f"- {s['title'] if isinstance(s, dict) else s}"
+        for s in raw_subs
+    )
     title = section["title"]
 
     is_legal = any(k in title.lower() for k in ["pháp lý", "luật", "quy định", "phap ly", "luat"])
@@ -1940,13 +1948,18 @@ async function streamAppendSections(subject, currentMode, selectedSections, exis
     }
 
     const content = document.getElementById('report-content');
-    const tempDiv = document.createElement('div');
-    tempDiv.innerHTML = appendedHtml;
-    content.appendChild(tempDiv);
+    if (content && appendedHtml) {
+      const tempDiv = document.createElement('div');
+      tempDiv.innerHTML = appendedHtml;
+      [...tempDiv.childNodes].forEach(child => content.appendChild(child.cloneNode(true)));
+    }
 
     reportHtml += '\n' + appendedHtml;
     buildTOC();
     buildSources();
+
+    content?.lastElementChild?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+
     closeModal('modal-append');
     appendCustomSections = [];
     statusEl.textContent = '✅ Đã bổ sung ' + selectedSections.length + ' sections';
