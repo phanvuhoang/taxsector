@@ -442,16 +442,31 @@ CAVEAT_HTML = """
 def safe_filename(s: str) -> str:
     return re.sub(r'[\\/*?:"<>|]', "", s)[:60].strip()
 
-def save_report(subject: str, html_content: str) -> str:
+def make_append_filename(original_filename: str) -> str:
+    """Create new filename for appended version: abc.html → abc-a01.html → abc-a02.html"""
+    base = original_filename.replace('.html', '')
+    match = re.search(r'-a(\d+)$', base)
+    if match:
+        n = int(match.group(1)) + 1
+        base = re.sub(r'-a\d+$', f'-a{n:02d}', base)
+    else:
+        base = base + '-a01'
+    return base + '.html'
+
+
+def save_report(subject: str, html_content: str, filename_override: str = None) -> str:
     now = datetime.now()
-    date_str = now.strftime("%d%m%Y")
-    time_str = now.strftime("%H%M")
-    base = safe_filename(subject)
-    name = f"{date_str} - {base} - {time_str}.html"
+    if filename_override:
+        name = filename_override
+    else:
+        date_str = now.strftime("%d%m%Y")
+        time_str = now.strftime("%H%M")
+        base = safe_filename(subject)
+        name = f"{date_str} - {base} - {time_str}.html"
 
     # Handle rare collision (same subject, same minute)
-    if (REPORTS_DIR / name).exists():
-        name = f"{date_str} - {base} - {now.strftime('%H%M%S')}.html"
+    if not filename_override and (REPORTS_DIR / name).exists():
+        name = f"{now.strftime('%d%m%Y')} - {safe_filename(subject)} - {now.strftime('%H%M%S')}.html"
 
     full_html = f"""<!DOCTYPE html>
 <html lang="vi">
@@ -1145,98 +1160,110 @@ def detect_existing_sections(html: str, sections_list: list) -> list:
     return existing
 
 
+async def run_append_job(job_id: str, subject: str, mode: str,
+                          new_sections: list, original_file: str):
+    job = jobs[job_id]
+    total = len(new_sections)
+    sonar = "sonar-pro"
+    try:
+        job["status"] = "running"
+
+        # Phase 1: Research sections mới
+        job["message"] = "🔍 Đang research với Perplexity..."
+        job["progress"] = 5
+
+        all_results: dict = {}
+        all_citations: list = []
+        tasks = [perplexity_search(build_query(s, subject, mode), sonar) for s in new_sections]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for s, r in zip(new_sections, results):
+            if not isinstance(r, Exception):
+                all_results[s["id"]] = r
+                all_citations.extend(r.get("citations", []))
+
+        # Phase 2: Generate từng section mới
+        new_html_parts = []
+        for i, section in enumerate(new_sections):
+            pct = 10 + int((i / max(total, 1)) * 80)
+            job["progress"] = pct
+            job["message"] = f"✍️ Đang viết {i+1}/{total}: {section['title']}"
+
+            ctx = filter_context(all_results, section)
+            ctx += f"\n\nLƯU Ý: Đây là phần BỔ SUNG vào báo cáo về {subject}. Viết nhất quán."
+
+            section_html = ""
+            async for chunk in claude_stream_section(section, subject, ctx, mode, i + 1):
+                section_html += chunk
+            new_html_parts.append(section_html)
+
+        # Phase 3: Đọc file gốc + ghép + save file mới
+        job["progress"] = 92
+        job["message"] = "💾 Đang lưu báo cáo bổ sung..."
+
+        unique_citations = list(dict.fromkeys(all_citations))
+        appended_html = "\n".join(new_html_parts)
+        appended_html = linkify_citations(appended_html, unique_citations)
+        appended_html = await verify_legal_refs(appended_html)
+
+        # Đọc nội dung file gốc nếu có
+        original_content = ""
+        if original_file:
+            orig_path = REPORTS_DIR / original_file
+            if orig_path.exists():
+                orig_full = orig_path.read_text(encoding="utf-8")
+                body_match = re.search(r'<div id="report-body">(.*?)</div>\s*<', orig_full, re.DOTALL)
+                if body_match:
+                    original_content = body_match.group(1)
+                else:
+                    body_match2 = re.search(r'<body[^>]*>(.*?)</body>', orig_full, re.DOTALL)
+                    if body_match2:
+                        original_content = body_match2.group(1)
+
+        combined_html = original_content + "\n" + appended_html if original_content else appended_html
+        new_filename = make_append_filename(original_file) if original_file else None
+        filename = save_report(subject, combined_html, filename_override=new_filename)
+
+        job["status"] = "done"
+        job["progress"] = 100
+        job["message"] = "✅ Báo cáo bổ sung đã lưu!"
+        job["filename"] = filename
+        job["done_at"] = datetime.now().isoformat()
+
+    except Exception as e:
+        job["status"] = "error"
+        job["message"] = f"❌ Lỗi: {str(e)}"
+        job["error"] = str(e)
+        import traceback; traceback.print_exc()
+
+
 @app.post("/append-sections")
 async def append_sections(request: Request, _user: str = Depends(auth)):
-    """Research + generate new sections and stream them back."""
-    body         = await request.json()
-    subject      = body.get("subject", "").strip()
-    mode         = body.get("mode", "sector")
-    new_sections = body.get("sections", [])
-    sonar        = body.get("sonar_model", "sonar")
-    existing_html = body.get("existing_html", "")
+    body          = await request.json()
+    subject       = body.get("subject", "").strip()
+    mode          = body.get("mode", "sector")
+    new_sections  = body.get("sections", [])
+    original_file = body.get("original_file", "")
 
-    if not subject:
-        raise HTTPException(400, "Missing subject")
-    enabled = [s for s in new_sections if s.get("enabled", True)]
-    if not enabled:
-        raise HTTPException(400, "No sections to append")
+    if not subject or not new_sections:
+        raise HTTPException(400, "subject and sections required")
 
-    async def generate():
-        def sse(data: dict) -> str:
-            return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+    job_id = str(uuid.uuid4())[:8]
+    jobs[job_id] = {
+        "status": "pending",
+        "progress": 0,
+        "message": "Đang khởi tạo bổ sung...",
+        "subject": subject,
+        "mode": mode,
+        "filename": None,
+        "original_file": original_file,
+        "is_append": True,
+        "error": None,
+        "created_at": datetime.now().isoformat(),
+        "done_at": None,
+    }
 
-        yield sse({"type": "ping"})
-        all_results: dict = {}
-        all_tvpl: dict = {}
-        all_citations: list = []
-        total = len(enabled)
-
-        for batch_start in range(0, total, 4):
-            batch = enabled[batch_start:batch_start + 4]
-            for i, sec in enumerate(batch):
-                yield sse({"type": "progress", "step": batch_start + i + 1,
-                            "total": total, "label": f"Đang nghiên cứu: {sec['title']}"})
-
-            perplexity_tasks = [perplexity_search(build_query(s, subject, mode), sonar) for s in batch]
-            tvpl_tasks = [
-                tvpl_search(build_tvpl_query(s, subject, mode)) if is_legal_or_tax_section(s) else _empty()
-                for s in batch
-            ]
-            perplexity_results, tvpl_results = await asyncio.gather(
-                asyncio.gather(*perplexity_tasks),
-                asyncio.gather(*tvpl_tasks),
-            )
-            for sec, pres, tres in zip(batch, perplexity_results, tvpl_results):
-                all_results[sec["id"]] = pres
-                all_tvpl[sec["id"]]    = tres or []
-                all_citations.extend(pres.get("citations", []))
-                all_citations.extend(d.get("url", "") for d in (tres or []) if d.get("url"))
-                yield sse({"type": "progress", "step": batch_start + batch.index(sec) + 1,
-                            "total": total, "label": f"Xong research: {sec['title']}"})
-
-        yield sse({"type": "ai_start", "total": len(enabled)})
-        appended_html = ""
-
-        for i, section in enumerate(enabled):
-            yield sse({"type": "status",
-                        "message": f"AI đang viết phần {i+1}/{len(enabled)}: {section['title']}"})
-            ctx = filter_context(all_results, section)
-            tvpl_docs = all_tvpl.get(section["id"], [])
-            if tvpl_docs and is_legal_or_tax_section(section):
-                tvpl_text = format_tvpl_results(tvpl_docs)
-                if tvpl_text:
-                    ctx = tvpl_text + "\n\n" + ctx
-            section_citations = all_results.get(section["id"], {}).get("citations", [])
-            tvpl_urls = [d.get("url", "") for d in tvpl_docs if d.get("url")]
-            all_section_urls = section_citations + tvpl_urls
-            if all_section_urls:
-                url_list = "\n".join(f"[{j+1}] {u}" for j, u in enumerate(all_section_urls[:20]))
-                ctx = f"=== DANH SÁCH URL NGUỒN (dùng cho citation) ===\n{url_list}\n\n" + ctx
-            if existing_html:
-                context_hint = (
-                    f"\n\nLƯU Ý: Đây là phần BỔ SUNG vào báo cáo về {subject}. "
-                    f"Báo cáo đã có {len(existing_html)//500} phần. "
-                    f"Viết nhất quán với nội dung đã có, không lặp lại."
-                )
-                ctx = ctx + context_hint
-
-            sec_html = ""
-            async for chunk in claude_stream_section(section, subject, ctx, mode, i + 1):
-                yield sse({"type": "chunk", "text": chunk})
-                sec_html += chunk
-                await asyncio.sleep(0)
-
-            appended_html += sec_html + "\n"
-            yield sse({"type": "ping"})
-
-        unique_urls = list(dict.fromkeys(all_citations))
-        yield sse({"type": "citations", "urls": unique_urls})
-        appended_html = linkify_citations(appended_html, list(dict.fromkeys(all_citations)))
-        appended_html = await verify_legal_refs(appended_html)
-        yield sse({"type": "done", "appended_html": appended_html})
-
-    return StreamingResponse(generate(), media_type="text/event-stream",
-                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    asyncio.create_task(run_append_job(job_id, subject, mode, new_sections, original_file))
+    return {"job_id": job_id}
 
 
 @app.post("/regenerate-section")
@@ -1439,6 +1466,25 @@ async function init() {
         localStorage.removeItem('current_job_id');
       }
     } catch(e) {}
+  }
+
+  // Resume append jobs
+  const appendJobs = JSON.parse(localStorage.getItem('append_jobs') || '[]');
+  for (const { job_id, subject } of appendJobs) {
+    try {
+      const r = await fetch(`/job/${job_id}`, { headers: { Authorization: AUTH } });
+      if (!r.ok) { removeAppendJob(job_id); continue; }
+      const job = await r.json();
+      if (job.status === 'done') {
+        showAppendDoneToast(job.filename, subject);
+        removeAppendJob(job_id);
+        await loadReportsCount();
+      } else if (job.status === 'running' || job.status === 'pending') {
+        startAppendPolling(job_id, subject);
+      } else {
+        removeAppendJob(job_id);
+      }
+    } catch(e) { removeAppendJob(job_id); }
   }
 }
 
@@ -2141,69 +2187,87 @@ async function doAppend() {
     .filter(Boolean);
   const toGenerate = [...checkedPreset, ...appendCustomSections.filter(s => s.enabled)];
   if (toGenerate.length === 0) { alert('Chọn ít nhất 1 section'); return; }
+
   const currentSubject = document.getElementById('rpt-title')?.textContent
-    ?.replace('Phân Tích Thuế — ', '') || '';
-  await streamAppendSections(currentSubject, mode, toGenerate, reportHtml);
-}
+    ?.replace('Phân Tích Thuế — ', '').trim() || '';
+  const originalFile = currentFile || '';
 
-async function streamAppendSections(subject, currentMode, selectedSections, existingHtml) {
   const statusEl = document.getElementById('append-status');
-  statusEl.textContent = '⏳ Đang generate...';
+  statusEl.textContent = '⏳ Đang gửi yêu cầu...';
 
-  if (appendAbortCtrl) appendAbortCtrl.abort();
-  appendAbortCtrl = new AbortController();
-
-  let appendedHtml = '';
   try {
     const resp = await fetch('/append-sections', {
       method: 'POST',
       headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ subject, mode: currentMode, sections: selectedSections, existing_html: existingHtml }),
-      signal: appendAbortCtrl.signal,
+      body: JSON.stringify({
+        subject: currentSubject,
+        mode,
+        sections: toGenerate,
+        original_file: originalFile,
+      }),
     });
+    if (!resp.ok) { statusEl.textContent = '❌ Lỗi server: ' + resp.status; return; }
 
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const lines = buf.split('\n');
-      buf = lines.pop();
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        try {
-          const evt = JSON.parse(line.slice(6));
-          if (evt.type === 'chunk') appendedHtml += evt.text;
-          if (evt.type === 'status') statusEl.textContent = evt.message;
-          if (evt.type === 'done') appendedHtml = evt.appended_html || appendedHtml;
-          if (evt.type === 'citations') citations = citations.concat(evt.urls || []);
-        } catch(e) {}
-      }
-    }
-
-    const content = document.getElementById('report-content');
-    if (content && appendedHtml) {
-      const tempDiv = document.createElement('div');
-      tempDiv.innerHTML = appendedHtml;
-      [...tempDiv.childNodes].forEach(child => content.appendChild(child.cloneNode(true)));
-    }
-
-    reportHtml += '\n' + appendedHtml;
-    buildTOC();
-    buildSources();
-
-    content?.lastElementChild?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    const { job_id } = await resp.json();
 
     closeModal('modal-append');
     appendCustomSections = [];
-    statusEl.textContent = '✅ Đã bổ sung ' + selectedSections.length + ' sections';
+
+    showAppendToast(job_id, currentSubject);
+    startAppendPolling(job_id, currentSubject);
 
   } catch(e) {
-    if (e.name !== 'AbortError') statusEl.textContent = '❌ Lỗi: ' + e.message;
+    statusEl.textContent = '❌ Lỗi: ' + e.message;
   }
+}
+
+// ── Append job polling ────────────────────────────────────────
+function startAppendPolling(job_id, subject) {
+  const appendJobs = JSON.parse(localStorage.getItem('append_jobs') || '[]');
+  appendJobs.push({ job_id, subject, started: Date.now() });
+  localStorage.setItem('append_jobs', JSON.stringify(appendJobs));
+
+  const timer = setInterval(async () => {
+    try {
+      const r = await fetch(`/job/${job_id}`, { headers: { Authorization: AUTH } });
+      const job = await r.json();
+      if (job.status === 'done') {
+        clearInterval(timer);
+        removeAppendJob(job_id);
+        await loadReportsCount();
+        showAppendDoneToast(job.filename, subject);
+      }
+      if (job.status === 'error') {
+        clearInterval(timer);
+        removeAppendJob(job_id);
+        alert('Lỗi bổ sung: ' + job.message);
+      }
+    } catch(e) {}
+  }, 3000);
+}
+
+function removeAppendJob(job_id) {
+  const stored = JSON.parse(localStorage.getItem('append_jobs') || '[]');
+  localStorage.setItem('append_jobs', JSON.stringify(stored.filter(j => j.job_id !== job_id)));
+}
+
+function showToast(html, duration = 8000) {
+  const toast = document.createElement('div');
+  toast.style.cssText = `position:fixed;bottom:2rem;right:2rem;z-index:9999;
+    background:#fff;border:1px solid #bbf7d0;border-radius:.75rem;
+    padding:1rem 1.5rem;box-shadow:0 4px 20px rgba(0,0,0,.1);max-width:320px;font-size:.875rem`;
+  toast.innerHTML = html;
+  document.body.appendChild(toast);
+  setTimeout(() => toast.remove(), duration);
+}
+
+function showAppendToast(job_id, subject) {
+  showToast(`⏳ Đang bổ sung báo cáo "<strong>${esc(subject)}</strong>" trong background...`, 8000);
+}
+
+function showAppendDoneToast(filename, subject) {
+  showToast(`✅ Bổ sung hoàn thành! <a href="#" onclick="loadSavedReport('${esc(filename)}');return false"
+    style="color:var(--brand);font-weight:600">Mở báo cáo →</a>`, 15000);
 }
 
 // ── Regenerate Section ────────────────────────────────────────
