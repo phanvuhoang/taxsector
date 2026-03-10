@@ -988,6 +988,7 @@ async def append_sections(request: Request, _user: str = Depends(auth)):
     mode         = body.get("mode", "sector")
     new_sections = body.get("sections", [])
     sonar        = body.get("sonar_model", "sonar")
+    existing_html = body.get("existing_html", "")
 
     if not subject:
         raise HTTPException(400, "Missing subject")
@@ -1046,6 +1047,13 @@ async def append_sections(request: Request, _user: str = Depends(auth)):
             if all_section_urls:
                 url_list = "\n".join(f"[{j+1}] {u}" for j, u in enumerate(all_section_urls[:20]))
                 ctx = f"=== DANH SÁCH URL NGUỒN (dùng cho citation) ===\n{url_list}\n\n" + ctx
+            if existing_html:
+                context_hint = (
+                    f"\n\nLƯU Ý: Đây là phần BỔ SUNG vào báo cáo về {subject}. "
+                    f"Báo cáo đã có {len(existing_html)//500} phần. "
+                    f"Viết nhất quán với nội dung đã có, không lặp lại."
+                )
+                ctx = ctx + context_hint
 
             sec_html = ""
             async for chunk in claude_stream_section(section, subject, ctx, mode, i + 1):
@@ -1072,10 +1080,11 @@ async def regenerate_section(request: Request, _user: str = Depends(auth)):
     body          = await request.json()
     subject       = body.get("subject", "").strip()
     mode          = body.get("mode", "sector")
-    section_id    = body.get("section_id", "s1")
-    section_title = body.get("section_title", "")
-    section_subs  = body.get("section_subs", [])
-    sonar         = body.get("sonar_model", "sonar")
+    section_id       = body.get("section_id", "s1")
+    section_title    = body.get("section_title", "")
+    section_subs     = body.get("section_subs", [])
+    sonar            = body.get("sonar_model", "sonar")
+    existing_context = body.get("existing_context", "")
 
     if not subject or not section_title:
         raise HTTPException(400, "Missing subject or section_title")
@@ -1106,6 +1115,8 @@ async def regenerate_section(request: Request, _user: str = Depends(auth)):
         if all_section_urls:
             url_list = "\n".join(f"[{j+1}] {u}" for j, u in enumerate(all_section_urls[:20]))
             ctx = f"=== DANH SÁCH URL NGUỒN (dùng cho citation) ===\n{url_list}\n\n" + ctx
+        if existing_context:
+            ctx = f"=== CÁC PHẦN XÃ HỘI (viết nhất quán) ===\n{existing_context[:1000]}\n\n" + ctx
 
         sec_html = ""
         async for chunk in claude_stream_section(section, subject, ctx, mode, 1):
@@ -1773,52 +1784,124 @@ document.querySelectorAll('[id^="modal-"]').forEach(m =>
 
 // ── Append Sections ───────────────────────────────────────────
 let appendAbortCtrl = null;
+let appendCustomSections = [];
 
 function openAppendModal() {
   if (!reportHtml) { alert('Chưa có báo cáo'); return; }
-  const allSecs = sections.length ? sections : (mode === 'sector' ? [] : []);
-  const subject = document.getElementById('rpt-title').textContent.replace('Phân Tích Thuế — ', '');
+  document.getElementById('append-topic-input').value = '';
+  document.getElementById('append-status').textContent = '';
+  renderAppendPreset();
+  renderAppendCustom();
+  openModal('modal-append');
+}
 
-  // Detect which sections already exist in the report
+function renderAppendPreset() {
+  const allSecs = sections.length ? sections : [];
   const content = document.getElementById('report-content').innerHTML;
   const parser = new DOMParser();
   const doc = parser.parseFromString(content, 'text/html');
   const headings = [...doc.querySelectorAll('h2')].map(h => h.textContent.toLowerCase());
-
-  const list = document.getElementById('append-section-list');
+  const list = document.getElementById('append-preset-list');
   list.innerHTML = '';
-  document.getElementById('append-status').textContent = '';
 
-  allSecs.forEach(sec => {
-    const exists = headings.some(h => h.includes(sec.title.toLowerCase()));
+  const missingSecs = allSecs.filter(sec => !headings.some(h => h.includes(sec.title.toLowerCase())));
+  if (!allSecs.length || missingSecs.length === 0) {
+    list.innerHTML = '<p class="text-sm py-2" style="color:var(--muted)">Đã có đầy đủ sections trong báo cáo.</p>';
+    return;
+  }
+  missingSecs.forEach(sec => {
     const div = document.createElement('div');
-    div.className = 'flex items-center gap-3 p-3 rounded-xl border transition-all ' +
-      (exists ? 'opacity-40' : 'hover:border-green-400');
+    div.className = 'flex items-center gap-3 p-2 rounded-lg border hover:border-green-400 transition-all';
     div.style.borderColor = 'var(--border)';
     div.innerHTML = `
-      <input type="checkbox" id="app-${esc(sec.id)}" value="${esc(sec.id)}" ${exists ? 'disabled' : ''}
+      <input type="checkbox" id="app-${esc(sec.id)}" value="${esc(sec.id)}"
         class="w-4 h-4 accent-green-600">
-      <label for="app-${esc(sec.id)}" class="flex-1 text-sm font-medium ${exists ? 'line-through' : 'cursor-pointer'}">
-        ${esc(sec.title)}
-        ${exists ? '<span class="ml-1 text-xs opacity-60">(đã có)</span>' : ''}
-      </label>`;
+      <label for="app-${esc(sec.id)}" class="flex-1 text-sm cursor-pointer">${esc(sec.title)}</label>`;
     list.appendChild(div);
   });
-
-  if (!allSecs.length) {
-    list.innerHTML = '<p class="text-sm text-center py-4" style="color:var(--muted)">Không có sections để bổ sung</p>';
-  }
-  openModal('modal-append');
 }
 
-async function runAppendSections() {
-  const subject = document.getElementById('rpt-title').textContent.replace('Phân Tích Thuế — ', '');
-  const checked = [...document.querySelectorAll('#append-section-list input:checked')].map(el => el.value);
-  if (!checked.length) { alert('Chưa chọn section nào'); return; }
+function renderAppendCustom() {
+  const container = document.getElementById('append-custom-list');
+  if (appendCustomSections.length === 0) {
+    container.innerHTML = '<p class="text-sm" style="color:var(--muted)">Chưa có phần tùy chỉnh nào.</p>';
+    return;
+  }
+  container.innerHTML = appendCustomSections.map(topic => `
+    <div class="border rounded-lg p-3 mb-2" style="border-color:var(--border);background:var(--bg)">
+      <div class="flex items-center justify-between mb-2">
+        <span class="font-medium text-sm">📄 ${esc(topic.title)}</span>
+        <button onclick="removeCustomTopic('${topic.id}')"
+          class="text-red-400 hover:text-red-600 text-xs">✕</button>
+      </div>
+      ${topic.sub.map(sub => `
+        <div class="flex items-center gap-2 ml-4 mb-1">
+          <span class="text-xs" style="color:var(--muted)">├ ${esc(sub.title)}</span>
+          <button onclick="removeSubtopic('${topic.id}','${sub.id}')"
+            class="text-red-300 hover:text-red-500 text-xs">✕</button>
+        </div>
+      `).join('')}
+      <div class="flex gap-2 ml-4 mt-2">
+        <input id="sub-input-${topic.id}" type="text"
+          placeholder="Thêm subtopic..."
+          onkeydown="if(event.key==='Enter')addSubtopic('${topic.id}')"
+          class="flex-1 border rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-green-400"
+          style="border-color:var(--border);background:var(--surface);color:var(--text)">
+        <button onclick="addSubtopic('${topic.id}')"
+          class="text-xs px-2 py-1 rounded"
+          style="background:#f0fdf4;color:#16a34a;border:1px solid #bbf7d0">+ Subtopic</button>
+      </div>
+    </div>
+  `).join('');
+}
 
-  const selectedSections = sections.filter(s => checked.includes(s.id))
-    .map((s, i) => ({...s, enabled: true}));
+function addCustomTopic() {
+  const input = document.getElementById('append-topic-input');
+  const title = input.value.trim();
+  if (!title) return;
+  const id = 'custom_' + Date.now();
+  appendCustomSections.push({id, title, sub: [], enabled: true});
+  input.value = '';
+  renderAppendCustom();
+}
 
+function addSubtopic(topicId) {
+  const input = document.getElementById('sub-input-' + topicId);
+  const title = input.value.trim();
+  if (!title) return;
+  const topic = appendCustomSections.find(s => s.id === topicId);
+  if (topic) {
+    topic.sub.push({id: 'sub_' + Date.now(), title});
+    input.value = '';
+    renderAppendCustom();
+  }
+}
+
+function removeCustomTopic(topicId) {
+  appendCustomSections = appendCustomSections.filter(s => s.id !== topicId);
+  renderAppendCustom();
+}
+
+function removeSubtopic(topicId, subId) {
+  const topic = appendCustomSections.find(s => s.id === topicId);
+  if (topic) {
+    topic.sub = topic.sub.filter(s => s.id !== subId);
+    renderAppendCustom();
+  }
+}
+
+async function doAppend() {
+  const checkedPreset = [...document.querySelectorAll('#append-preset-list input:checked')]
+    .map(cb => sections.find(s => s.id === cb.value))
+    .filter(Boolean);
+  const toGenerate = [...checkedPreset, ...appendCustomSections.filter(s => s.enabled)];
+  if (toGenerate.length === 0) { alert('Chọn ít nhất 1 section'); return; }
+  const currentSubject = document.getElementById('rpt-title')?.textContent
+    ?.replace('Phân Tích Thuế — ', '') || '';
+  await streamAppendSections(currentSubject, mode, toGenerate, reportHtml);
+}
+
+async function streamAppendSections(subject, currentMode, selectedSections, existingHtml) {
   const statusEl = document.getElementById('append-status');
   statusEl.textContent = '⏳ Đang generate...';
 
@@ -1830,7 +1913,7 @@ async function runAppendSections() {
     const resp = await fetch('/append-sections', {
       method: 'POST',
       headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ subject, mode, sections: selectedSections }),
+      body: JSON.stringify({ subject, mode: currentMode, sections: selectedSections, existing_html: existingHtml }),
       signal: appendAbortCtrl.signal,
     });
 
@@ -1856,7 +1939,6 @@ async function runAppendSections() {
       }
     }
 
-    // Append to live report
     const content = document.getElementById('report-content');
     const tempDiv = document.createElement('div');
     tempDiv.innerHTML = appendedHtml;
@@ -1866,6 +1948,7 @@ async function runAppendSections() {
     buildTOC();
     buildSources();
     closeModal('modal-append');
+    appendCustomSections = [];
     statusEl.textContent = '✅ Đã bổ sung ' + selectedSections.length + ' sections';
 
   } catch(e) {
@@ -1925,6 +2008,22 @@ async function confirmRegenSection(h2El) {
   const sec = sections.find(s => title.toLowerCase().includes(s.title.toLowerCase()));
   if (!sec) { alert('Không tìm thấy section config. Thử regenerate từ đầu.'); return; }
 
+  // Gather surrounding sections as context
+  const reportContent = document.getElementById('report-content');
+  const h2s = [...reportContent.querySelectorAll('h2')];
+  const idx = h2s.indexOf(h2El);
+  let existing_context = '';
+  [idx - 1, idx + 1].filter(i => i >= 0 && i < h2s.length).forEach(i => {
+    const h = h2s[i];
+    let text = h.textContent + '\n';
+    let node = h.nextSibling;
+    while (node && !(node.nodeType === 1 && node.tagName === 'H2')) {
+      if (node.textContent) text += node.textContent + '\n';
+      node = node.nextSibling;
+    }
+    existing_context += text.slice(0, 500) + '\n\n';
+  });
+
   // Show inline spinner
   const spinner = document.createElement('span');
   spinner.textContent = ' ⏳ Đang regenerate...';
@@ -1942,6 +2041,7 @@ async function confirmRegenSection(h2El) {
         section_id: sec.id,
         section_title: sec.title,
         section_subs: sec.sub || [],
+        existing_context,
       }),
     });
 
@@ -2203,15 +2303,34 @@ function replaceSectionInDOM(h2El, newSectionHtml) {
   <div class="bg-white rounded-2xl shadow-2xl w-full max-w-lg mx-4 max-h-[85vh] flex flex-col"
        style="background:var(--surface);color:var(--text)">
     <div class="p-5 border-b flex items-center justify-between" style="border-color:var(--border)">
-      <div>
-        <h2 class="font-bold text-lg">➕ Bổ sung sections vào báo cáo</h2>
-        <p class="text-xs mt-0.5" style="color:var(--muted)">Chọn section chưa có để generate thêm</p>
-      </div>
-      <button onclick="closeModal('modal-append')" class="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
+      <h2 class="font-bold text-lg">➕ Bổ sung vào báo cáo</h2>
+      <button onclick="closeModal('modal-append');appendCustomSections=[];" class="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
     </div>
-    <div id="append-section-list" class="flex-1 overflow-y-auto p-5 space-y-2"></div>
+    <div class="flex-1 overflow-y-auto p-5 space-y-4">
+      <!-- Preset sections -->
+      <div>
+        <p class="text-xs font-semibold mb-2 uppercase tracking-wide" style="color:var(--muted)">📋 Sections có sẵn (chưa có trong báo cáo)</p>
+        <div id="append-preset-list" class="space-y-1"></div>
+      </div>
+      <hr style="border-color:var(--border)">
+      <!-- Custom sections -->
+      <div>
+        <p class="text-xs font-semibold mb-2 uppercase tracking-wide" style="color:var(--muted)">✏️ Thêm phần tùy chỉnh</p>
+        <div class="flex gap-2 mb-3">
+          <input id="append-topic-input" type="text"
+            placeholder="Nhập tên phần mới..."
+            onkeydown="if(event.key==='Enter')addCustomTopic()"
+            class="flex-1 border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-400"
+            style="border-color:var(--border);background:var(--bg);color:var(--text)">
+          <button onclick="addCustomTopic()"
+            class="px-3 py-2 rounded-lg text-sm font-medium"
+            style="background:#f0fdf4;color:#16a34a;border:1px solid #bbf7d0">+ Thêm</button>
+        </div>
+        <div id="append-custom-list"></div>
+      </div>
+    </div>
     <div class="p-5 border-t flex gap-3 items-center" style="border-color:var(--border)">
-      <button onclick="runAppendSections()"
+      <button onclick="doAppend()"
         class="px-5 py-2.5 rounded-xl text-sm font-semibold text-white"
         style="background:#028a39">
         ➕ Generate sections đã chọn
@@ -2223,7 +2342,11 @@ function replaceSectionInDOM(h2El, newSectionHtml) {
 
 <script>
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') { closeModal('modal-reports'); closeModal('modal-append'); }
+  if (e.key === 'Escape') {
+    closeModal('modal-reports');
+    closeModal('modal-append');
+    appendCustomSections = [];
+  }
 });
 </script>
 </body>
