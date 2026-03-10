@@ -1194,203 +1194,6 @@ body.dark .btn-green{background:#064e3b;border-color:#065f46;color:#6ee7b7}
 body.dark input,body.dark textarea,body.dark select{background:#1e293b;color:var(--text);border-color:var(--border)}
 body.dark .sec-card input[type=text]{background:transparent}
 </style>
-</head>
-<body>
-<div id="reading-bar"></div>
-
-<!-- ── Login Modal ──────────────────────────────────────────── -->
-<div id="login-modal" class="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
-  <div class="bg-white rounded-2xl shadow-2xl p-8 w-full max-w-sm mx-4">
-    <div class="text-center mb-6">
-      <div class="text-5xl mb-3">📊</div>
-      <h1 class="text-2xl font-bold text-gray-800">Tax Research</h1>
-      <p class="text-gray-400 text-sm mt-1">Phân tích thuế AI — Việt Nam</p>
-    </div>
-    <div class="space-y-3">
-      <input id="li-user" type="text" placeholder="Tên đăng nhập" value="hoang"
-        class="w-full border rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-green-400 text-gray-800">
-      <input id="li-pass" type="password" placeholder="Mật khẩu"
-        class="w-full border rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-green-400 text-gray-800"
-        onkeydown="if(event.key==='Enter')doLogin()">
-      <button onclick="doLogin()"
-        class="w-full bg-green-600 hover:bg-green-700 text-white font-semibold py-2.5 rounded-lg transition">
-        Đăng nhập
-      </button>
-      <p id="li-err" class="text-red-500 text-sm text-center hidden">Sai tên đăng nhập hoặc mật khẩu</p>
-    </div>
-  </div>
-</div>
-
-<!-- ── App Shell ─────────────────────────────────────────────── -->
-<div id="app" class="max-w-4xl mx-auto px-4 py-5">
-
-  <!-- Header -->
-  <header class="flex items-center justify-between mb-5">
-    <div class="flex items-center gap-3 cursor-pointer" onclick="newReport()">
-      <span class="text-3xl">📊</span>
-      <div>
-        <h1 class="text-lg font-bold">Tax Sector Research</h1>
-        <p class="text-xs" style="color:var(--muted)">Phân tích thuế AI — Việt Nam</p>
-      </div>
-    </div>
-    <button onclick="toggleDark()" id="dark-btn" class="text-xl p-2 rounded-lg btn-gray">☀️</button>
-  </header>
-
-  <!-- ── SETUP PHASE ─────────────────────────────────────────── -->
-  <div id="ph-setup">
-    <!-- Tabs -->
-    <div class="flex gap-2 mb-4">
-      <button id="tab-sector" onclick="setMode('sector')"
-        class="px-5 py-2 rounded-full text-sm font-medium transition bg-green-600 text-white">
-        🏭 Ngành / Lĩnh vực
-      </button>
-      <button id="tab-company" onclick="setMode('company')"
-        class="px-5 py-2 rounded-full text-sm font-medium transition bg-gray-100 text-gray-600 hover:bg-gray-200">
-        🏢 Doanh nghiệp
-      </button>
-    </div>
-
-    <!-- Reports shortcut -->
-    <div class="mt-4 text-center">
-      <button onclick="openReports()"
-        class="btn btn-gray text-sm px-5 py-2">
-        📂 Báo cáo đã lưu
-        <span id="reports-badge" class="ml-1 text-xs opacity-60"></span>
-      </button>
-    </div>
-
-    <!-- Subject input -->
-    <div class="surface rounded-xl p-5 mb-4 shadow-sm">
-      <label id="subj-label" class="block text-sm font-medium mb-2">Tên ngành / lĩnh vực:</label>
-      <input id="subj-input" type="text"
-        placeholder="VD: Bất động sản, Fintech, Sản xuất thép, Thương mại điện tử..."
-        class="w-full border border-gray-200 rounded-lg px-4 py-3 text-lg focus:outline-none focus:ring-2 focus:ring-green-400"
-        onkeydown="if(event.key==='Enter')startResearch()">
-      <div class="flex items-center gap-5 mt-3">
-        <span class="text-sm" style="color:var(--muted)">Research model:</span>
-        <label class="flex items-center gap-1.5 cursor-pointer text-sm">
-          <input type="radio" name="sonar" value="sonar" checked class="accent-green-600"> Sonar (nhanh)
-        </label>
-        <label class="flex items-center gap-1.5 cursor-pointer text-sm">
-          <input type="radio" name="sonar" value="sonar-pro" class="accent-green-600"> Sonar Pro (sâu)
-        </label>
-      </div>
-    </div>
-
-    <!-- Section editor -->
-    <div class="surface rounded-xl p-5 mb-4 shadow-sm">
-      <div class="flex items-center justify-between mb-3">
-        <h2 class="font-semibold text-sm uppercase tracking-wide" style="color:var(--muted)">Cấu trúc báo cáo</h2>
-        <div class="flex gap-2">
-          <button onclick="resetSections()" class="btn btn-gray text-xs">↩ Đặt lại</button>
-          <button onclick="addSection()" class="btn btn-green text-xs">+ Thêm phần</button>
-        </div>
-      </div>
-      <div id="sections-list"></div>
-    </div>
-
-    <!-- Submit -->
-    <button onclick="startResearch()"
-      class="w-full bg-green-600 hover:bg-green-700 active:bg-green-800 text-white font-bold
-             py-4 rounded-xl text-lg shadow-md transition">
-      🔍 Bắt đầu phân tích
-    </button>
-    <p class="text-center text-xs mt-2" style="color:var(--muted)">Ước tính 2–5 phút tuỳ số lượng phần</p>
-  </div>
-
-  <!-- ── PROGRESS PHASE ──────────────────────────────────────── -->
-  <div id="ph-progress" class="hidden">
-    <div class="surface rounded-xl p-5 mb-4 shadow-sm">
-      <div class="flex items-center gap-3 mb-4">
-        <div class="animate-spin text-2xl select-none">⚙️</div>
-        <div class="flex-1">
-          <p id="prog-status" class="font-medium">Đang khởi động...</p>
-          <p id="prog-subject" class="text-sm" style="color:var(--muted)"></p>
-        </div>
-        <button onclick="cancelResearch()" class="btn btn-gray text-xs text-red-500">✕ Huỷ</button>
-      </div>
-      <div class="h-2 bg-gray-100 rounded-full overflow-hidden">
-        <div id="prog-bar" class="h-full bg-green-500 transition-all duration-500 rounded-full" style="width:0%"></div>
-      </div>
-      <div class="flex justify-between text-xs mt-1" style="color:var(--muted)">
-        <span id="prog-label">Bắt đầu...</span>
-        <span id="prog-pct">0%</span>
-      </div>
-    </div>
-    <div id="step-list" class="space-y-2 mb-4"></div>
-    <div id="partial-wrap" class="surface rounded-xl p-5 hidden">
-      <p class="font-medium text-green-700 mb-3 text-sm">📝 Đang tạo báo cáo...</p>
-      <div id="partial-body" class="text-sm overflow-y-auto max-h-80"></div>
-    </div>
-  </div>
-
-  <!-- ── REPORT PHASE ────────────────────────────────────────── -->
-  <div id="ph-report" class="hidden">
-    <!-- Toolbar -->
-    <div class="no-print flex flex-wrap items-center gap-2 mb-4 surface rounded-xl p-3 shadow-sm sticky top-2 z-40">
-      <button onclick="window.print()" class="btn btn-gray">🖨️ In/PDF</button>
-      <button id="btn-slides" onclick="doSlides()" class="btn btn-gray">📑 Slides PPTX</button>
-      <button id="btn-docx" onclick="doDocx()" class="btn btn-gray">📄 Word</button>
-      <button onclick="openReports()" class="btn btn-gray">📂 Báo cáo đã lưu</button>
-      <button onclick="openAppendModal()" class="btn btn-gray">➕ Bổ sung</button>
-      <button id="btn-regen-hint" class="btn btn-gray" onclick="toggleRegenMode()" title="Bật chế độ regenerate từng section">🔄 Regenerate</button>
-      <div class="flex-1"></div>
-      <button onclick="chgFont(-1)" class="btn btn-gray font-bold">A−</button>
-      <button onclick="chgFont(1)"  class="btn btn-gray font-bold">A+</button>
-      <button onclick="toggleDark()" id="dark-btn2" class="btn btn-gray">☀️</button>
-      <button onclick="newReport()" class="btn btn-green">+ Mới</button>
-    </div>
-
-    <!-- Report card -->
-    <div class="surface rounded-xl shadow-sm overflow-hidden">
-      <!-- Header band -->
-      <div class="bg-green-700 text-white px-6 py-5">
-        <p class="text-green-300 text-xs uppercase tracking-widest font-medium">Báo cáo phân tích thuế</p>
-        <h1 id="rpt-title" class="text-xl font-bold mt-1">—</h1>
-        <p id="rpt-meta" class="text-green-300 text-xs mt-1"></p>
-      </div>
-      <!-- TOC -->
-      <div id="toc-wrap" class="border-b px-6 py-3 bg-gray-50 hidden" style="background:var(--bg)">
-        <p class="text-xs font-semibold uppercase tracking-wide mb-2" style="color:var(--muted)">Mục lục</p>
-        <div id="toc-list" class="space-y-0.5"></div>
-      </div>
-      <!-- Content -->
-      <div id="report-content" class="px-8 py-6" style="font-size:16px"></div>
-      <!-- Sources -->
-      <div id="src-wrap" class="border-t px-6 py-4 hidden" style="background:var(--bg)">
-        <button onclick="toggleSrc()" class="text-sm font-semibold flex items-center gap-2" style="color:var(--muted)">
-          <span id="src-arrow">▶</span> Nguồn tham khảo (<span id="src-count">0</span>)
-        </button>
-        <div id="src-list" class="hidden mt-2 space-y-1"></div>
-      </div>
-    </div>
-  </div>
-</div><!-- /app -->
-
-<!-- ── Reports Modal ─────────────────────────────────────────── -->
-<div id="modal-reports" class="fixed inset-0 bg-black/50 z-50 hidden flex items-center justify-center">
-  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-xl mx-4 max-h-[85vh] flex flex-col"
-       style="background:var(--surface);color:var(--text)">
-    <!-- Header -->
-    <div class="p-5 border-b flex items-center justify-between" style="border-color:var(--border)">
-      <div>
-        <h2 class="font-bold text-lg">📂 Báo cáo đã lưu</h2>
-        <p class="text-xs mt-0.5" style="color:var(--muted)">Mới nhất → cũ nhất</p>
-      </div>
-      <button onclick="closeModal('modal-reports')" class="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
-    </div>
-    <!-- Search box -->
-    <div class="px-4 pt-3 pb-2">
-      <input type="text" id="reports-search"
-        placeholder="🔍 Tìm kiếm theo tên báo cáo..."
-        oninput="filterReports(this.value)"
-        class="w-full px-3 py-2 text-sm rounded-lg border focus:outline-none focus:ring-2"
-        style="border-color:var(--border);background:var(--bg);color:var(--text);--tw-ring-color:var(--accent)">
-    </div>
-    <!-- List -->
-    <div id="reports-list" class="flex-1 overflow-y-auto px-4 pb-4 space-y-2"></div>
-  </div>
-</div>
 
 
 <script>
@@ -1968,31 +1771,6 @@ document.querySelectorAll('[id^="modal-"]').forEach(m =>
   m.addEventListener('click', e => { if (e.target === m) closeModal(m.id); }));
 
 
-<!-- ── Append Sections Modal ─────────────────────────────────── -->
-<div id="modal-append" class="fixed inset-0 bg-black/50 z-50 hidden flex items-center justify-center">
-  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-lg mx-4 max-h-[85vh] flex flex-col"
-       style="background:var(--surface);color:var(--text)">
-    <div class="p-5 border-b flex items-center justify-between" style="border-color:var(--border)">
-      <div>
-        <h2 class="font-bold text-lg">➕ Bổ sung sections vào báo cáo</h2>
-        <p class="text-xs mt-0.5" style="color:var(--muted)">Chọn section chưa có để generate thêm</p>
-      </div>
-      <button onclick="closeModal('modal-append')" class="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
-    </div>
-    <div id="append-section-list" class="flex-1 overflow-y-auto p-5 space-y-2"></div>
-    <div class="p-5 border-t flex gap-3 items-center" style="border-color:var(--border)">
-      <button onclick="runAppendSections()"
-        class="px-5 py-2.5 rounded-xl text-sm font-semibold text-white"
-        style="background:#028a39">
-        ➕ Generate sections đã chọn
-      </button>
-      <span id="append-status" class="text-sm" style="color:var(--muted)"></span>
-    </div>
-  </div>
-</div>
-
-<script>
-
 // ── Append Sections ───────────────────────────────────────────
 let appendAbortCtrl = null;
 
@@ -2219,8 +1997,229 @@ function replaceSectionInDOM(h2El, newSectionHtml) {
   const refNode = node || null;
   [...tempDiv.childNodes].forEach(child => content.insertBefore(child.cloneNode(true), refNode));
 }
-
 </script>
+
+</head>
+<body>
+<div id="reading-bar"></div>
+
+<!-- ── Login Modal ──────────────────────────────────────────── -->
+<div id="login-modal" class="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
+  <div class="bg-white rounded-2xl shadow-2xl p-8 w-full max-w-sm mx-4">
+    <div class="text-center mb-6">
+      <div class="text-5xl mb-3">📊</div>
+      <h1 class="text-2xl font-bold text-gray-800">Tax Research</h1>
+      <p class="text-gray-400 text-sm mt-1">Phân tích thuế AI — Việt Nam</p>
+    </div>
+    <div class="space-y-3">
+      <input id="li-user" type="text" placeholder="Tên đăng nhập" value="hoang"
+        class="w-full border rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-green-400 text-gray-800">
+      <input id="li-pass" type="password" placeholder="Mật khẩu"
+        class="w-full border rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-green-400 text-gray-800"
+        onkeydown="if(event.key==='Enter')doLogin()">
+      <button onclick="doLogin()"
+        class="w-full bg-green-600 hover:bg-green-700 text-white font-semibold py-2.5 rounded-lg transition">
+        Đăng nhập
+      </button>
+      <p id="li-err" class="text-red-500 text-sm text-center hidden">Sai tên đăng nhập hoặc mật khẩu</p>
+    </div>
+  </div>
+</div>
+
+<!-- ── App Shell ─────────────────────────────────────────────── -->
+<div id="app" class="max-w-4xl mx-auto px-4 py-5">
+
+  <!-- Header -->
+  <header class="flex items-center justify-between mb-5">
+    <div class="flex items-center gap-3 cursor-pointer" onclick="newReport()">
+      <span class="text-3xl">📊</span>
+      <div>
+        <h1 class="text-lg font-bold">Tax Sector Research</h1>
+        <p class="text-xs" style="color:var(--muted)">Phân tích thuế AI — Việt Nam</p>
+      </div>
+    </div>
+    <button onclick="toggleDark()" id="dark-btn" class="text-xl p-2 rounded-lg btn-gray">☀️</button>
+  </header>
+
+  <!-- ── SETUP PHASE ─────────────────────────────────────────── -->
+  <div id="ph-setup">
+    <!-- Tabs -->
+    <div class="flex gap-2 mb-4">
+      <button id="tab-sector" onclick="setMode('sector')"
+        class="px-5 py-2 rounded-full text-sm font-medium transition bg-green-600 text-white">
+        🏭 Ngành / Lĩnh vực
+      </button>
+      <button id="tab-company" onclick="setMode('company')"
+        class="px-5 py-2 rounded-full text-sm font-medium transition bg-gray-100 text-gray-600 hover:bg-gray-200">
+        🏢 Doanh nghiệp
+      </button>
+    </div>
+
+    <!-- Reports shortcut -->
+    <div class="mt-4 text-center">
+      <button onclick="openReports()"
+        class="btn btn-gray text-sm px-5 py-2">
+        📂 Báo cáo đã lưu
+        <span id="reports-badge" class="ml-1 text-xs opacity-60"></span>
+      </button>
+    </div>
+
+    <!-- Subject input -->
+    <div class="surface rounded-xl p-5 mb-4 shadow-sm">
+      <label id="subj-label" class="block text-sm font-medium mb-2">Tên ngành / lĩnh vực:</label>
+      <input id="subj-input" type="text"
+        placeholder="VD: Bất động sản, Fintech, Sản xuất thép, Thương mại điện tử..."
+        class="w-full border border-gray-200 rounded-lg px-4 py-3 text-lg focus:outline-none focus:ring-2 focus:ring-green-400"
+        onkeydown="if(event.key==='Enter')startResearch()">
+      <div class="flex items-center gap-5 mt-3">
+        <span class="text-sm" style="color:var(--muted)">Research model:</span>
+        <label class="flex items-center gap-1.5 cursor-pointer text-sm">
+          <input type="radio" name="sonar" value="sonar" checked class="accent-green-600"> Sonar (nhanh)
+        </label>
+        <label class="flex items-center gap-1.5 cursor-pointer text-sm">
+          <input type="radio" name="sonar" value="sonar-pro" class="accent-green-600"> Sonar Pro (sâu)
+        </label>
+      </div>
+    </div>
+
+    <!-- Section editor -->
+    <div class="surface rounded-xl p-5 mb-4 shadow-sm">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="font-semibold text-sm uppercase tracking-wide" style="color:var(--muted)">Cấu trúc báo cáo</h2>
+        <div class="flex gap-2">
+          <button onclick="resetSections()" class="btn btn-gray text-xs">↩ Đặt lại</button>
+          <button onclick="addSection()" class="btn btn-green text-xs">+ Thêm phần</button>
+        </div>
+      </div>
+      <div id="sections-list"></div>
+    </div>
+
+    <!-- Submit -->
+    <button onclick="startResearch()"
+      class="w-full bg-green-600 hover:bg-green-700 active:bg-green-800 text-white font-bold
+             py-4 rounded-xl text-lg shadow-md transition">
+      🔍 Bắt đầu phân tích
+    </button>
+    <p class="text-center text-xs mt-2" style="color:var(--muted)">Ước tính 2–5 phút tuỳ số lượng phần</p>
+  </div>
+
+  <!-- ── PROGRESS PHASE ──────────────────────────────────────── -->
+  <div id="ph-progress" class="hidden">
+    <div class="surface rounded-xl p-5 mb-4 shadow-sm">
+      <div class="flex items-center gap-3 mb-4">
+        <div class="animate-spin text-2xl select-none">⚙️</div>
+        <div class="flex-1">
+          <p id="prog-status" class="font-medium">Đang khởi động...</p>
+          <p id="prog-subject" class="text-sm" style="color:var(--muted)"></p>
+        </div>
+        <button onclick="cancelResearch()" class="btn btn-gray text-xs text-red-500">✕ Huỷ</button>
+      </div>
+      <div class="h-2 bg-gray-100 rounded-full overflow-hidden">
+        <div id="prog-bar" class="h-full bg-green-500 transition-all duration-500 rounded-full" style="width:0%"></div>
+      </div>
+      <div class="flex justify-between text-xs mt-1" style="color:var(--muted)">
+        <span id="prog-label">Bắt đầu...</span>
+        <span id="prog-pct">0%</span>
+      </div>
+    </div>
+    <div id="step-list" class="space-y-2 mb-4"></div>
+    <div id="partial-wrap" class="surface rounded-xl p-5 hidden">
+      <p class="font-medium text-green-700 mb-3 text-sm">📝 Đang tạo báo cáo...</p>
+      <div id="partial-body" class="text-sm overflow-y-auto max-h-80"></div>
+    </div>
+  </div>
+
+  <!-- ── REPORT PHASE ────────────────────────────────────────── -->
+  <div id="ph-report" class="hidden">
+    <!-- Toolbar -->
+    <div class="no-print flex flex-wrap items-center gap-2 mb-4 surface rounded-xl p-3 shadow-sm sticky top-2 z-40">
+      <button onclick="window.print()" class="btn btn-gray">🖨️ In/PDF</button>
+      <button id="btn-slides" onclick="doSlides()" class="btn btn-gray">📑 Slides PPTX</button>
+      <button id="btn-docx" onclick="doDocx()" class="btn btn-gray">📄 Word</button>
+      <button onclick="openReports()" class="btn btn-gray">📂 Báo cáo đã lưu</button>
+      <button onclick="openAppendModal()" class="btn btn-gray">➕ Bổ sung</button>
+      <button id="btn-regen-hint" class="btn btn-gray" onclick="toggleRegenMode()" title="Bật chế độ regenerate từng section">🔄 Regenerate</button>
+      <div class="flex-1"></div>
+      <button onclick="chgFont(-1)" class="btn btn-gray font-bold">A−</button>
+      <button onclick="chgFont(1)"  class="btn btn-gray font-bold">A+</button>
+      <button onclick="toggleDark()" id="dark-btn2" class="btn btn-gray">☀️</button>
+      <button onclick="newReport()" class="btn btn-green">+ Mới</button>
+    </div>
+
+    <!-- Report card -->
+    <div class="surface rounded-xl shadow-sm overflow-hidden">
+      <!-- Header band -->
+      <div class="bg-green-700 text-white px-6 py-5">
+        <p class="text-green-300 text-xs uppercase tracking-widest font-medium">Báo cáo phân tích thuế</p>
+        <h1 id="rpt-title" class="text-xl font-bold mt-1">—</h1>
+        <p id="rpt-meta" class="text-green-300 text-xs mt-1"></p>
+      </div>
+      <!-- TOC -->
+      <div id="toc-wrap" class="border-b px-6 py-3 bg-gray-50 hidden" style="background:var(--bg)">
+        <p class="text-xs font-semibold uppercase tracking-wide mb-2" style="color:var(--muted)">Mục lục</p>
+        <div id="toc-list" class="space-y-0.5"></div>
+      </div>
+      <!-- Content -->
+      <div id="report-content" class="px-8 py-6" style="font-size:16px"></div>
+      <!-- Sources -->
+      <div id="src-wrap" class="border-t px-6 py-4 hidden" style="background:var(--bg)">
+        <button onclick="toggleSrc()" class="text-sm font-semibold flex items-center gap-2" style="color:var(--muted)">
+          <span id="src-arrow">▶</span> Nguồn tham khảo (<span id="src-count">0</span>)
+        </button>
+        <div id="src-list" class="hidden mt-2 space-y-1"></div>
+      </div>
+    </div>
+  </div>
+</div><!-- /app -->
+
+<!-- ── Reports Modal ─────────────────────────────────────────── -->
+<div id="modal-reports" class="fixed inset-0 bg-black/50 z-50 hidden flex items-center justify-center">
+  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-xl mx-4 max-h-[85vh] flex flex-col"
+       style="background:var(--surface);color:var(--text)">
+    <!-- Header -->
+    <div class="p-5 border-b flex items-center justify-between" style="border-color:var(--border)">
+      <div>
+        <h2 class="font-bold text-lg">📂 Báo cáo đã lưu</h2>
+        <p class="text-xs mt-0.5" style="color:var(--muted)">Mới nhất → cũ nhất</p>
+      </div>
+      <button onclick="closeModal('modal-reports')" class="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
+    </div>
+    <!-- Search box -->
+    <div class="px-4 pt-3 pb-2">
+      <input type="text" id="reports-search"
+        placeholder="🔍 Tìm kiếm theo tên báo cáo..."
+        oninput="filterReports(this.value)"
+        class="w-full px-3 py-2 text-sm rounded-lg border focus:outline-none focus:ring-2"
+        style="border-color:var(--border);background:var(--bg);color:var(--text);--tw-ring-color:var(--accent)">
+    </div>
+    <!-- List -->
+    <div id="reports-list" class="flex-1 overflow-y-auto px-4 pb-4 space-y-2"></div>
+  </div>
+</div>
+
+
+<!-- ── Append Sections Modal ─────────────────────────────────── -->
+<div id="modal-append" class="fixed inset-0 bg-black/50 z-50 hidden flex items-center justify-center">
+  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-lg mx-4 max-h-[85vh] flex flex-col"
+       style="background:var(--surface);color:var(--text)">
+    <div class="p-5 border-b flex items-center justify-between" style="border-color:var(--border)">
+      <div>
+        <h2 class="font-bold text-lg">➕ Bổ sung sections vào báo cáo</h2>
+        <p class="text-xs mt-0.5" style="color:var(--muted)">Chọn section chưa có để generate thêm</p>
+      </div>
+      <button onclick="closeModal('modal-append')" class="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
+    </div>
+    <div id="append-section-list" class="flex-1 overflow-y-auto p-5 space-y-2"></div>
+    <div class="p-5 border-t flex gap-3 items-center" style="border-color:var(--border)">
+      <button onclick="runAppendSections()"
+        class="px-5 py-2.5 rounded-xl text-sm font-semibold text-white"
+        style="background:#028a39">
+        ➕ Generate sections đã chọn
+      </button>
+      <span id="append-status" class="text-sm" style="color:var(--muted)"></span>
+    </div>
+  </div>
+</div>
 
 <script>
 document.addEventListener('keydown', e => {
