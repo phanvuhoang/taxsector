@@ -966,6 +966,162 @@ async def export_pptx(request: Request, _user: str = Depends(auth)):
         headers={"Content-Disposition": f'attachment; filename="TaxSlides_{safe}.pptx"'},
     )
 
+
+# ── Append & Regenerate sections ─────────────────────────────────────────────
+def detect_existing_sections(html: str, sections_list: list) -> list:
+    """Return list of section ids already present in html."""
+    from bs4 import BeautifulSoup as _BS
+    existing = []
+    soup = _BS(html, "html.parser")
+    headings = [h.get_text(strip=True).lower() for h in soup.find_all("h2")]
+    for s in sections_list:
+        if any(s["title"].lower() in h for h in headings):
+            existing.append(s["id"])
+    return existing
+
+
+@app.post("/append-sections")
+async def append_sections(request: Request, _user: str = Depends(auth)):
+    """Research + generate new sections and stream them back."""
+    body         = await request.json()
+    subject      = body.get("subject", "").strip()
+    mode         = body.get("mode", "sector")
+    new_sections = body.get("sections", [])
+    sonar        = body.get("sonar_model", "sonar")
+
+    if not subject:
+        raise HTTPException(400, "Missing subject")
+    enabled = [s for s in new_sections if s.get("enabled", True)]
+    if not enabled:
+        raise HTTPException(400, "No sections to append")
+
+    async def generate():
+        def sse(data: dict) -> str:
+            return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+        yield sse({"type": "ping"})
+        all_results: dict = {}
+        all_tvpl: dict = {}
+        all_citations: list = []
+        total = len(enabled)
+
+        for batch_start in range(0, total, 4):
+            batch = enabled[batch_start:batch_start + 4]
+            for i, sec in enumerate(batch):
+                yield sse({"type": "progress", "step": batch_start + i + 1,
+                            "total": total, "label": f"Đang nghiên cứu: {sec['title']}"})
+
+            perplexity_tasks = [perplexity_search(build_query(s, subject, mode), sonar) for s in batch]
+            tvpl_tasks = [
+                tvpl_search(build_tvpl_query(s, subject, mode)) if is_legal_or_tax_section(s) else _empty()
+                for s in batch
+            ]
+            perplexity_results, tvpl_results = await asyncio.gather(
+                asyncio.gather(*perplexity_tasks),
+                asyncio.gather(*tvpl_tasks),
+            )
+            for sec, pres, tres in zip(batch, perplexity_results, tvpl_results):
+                all_results[sec["id"]] = pres
+                all_tvpl[sec["id"]]    = tres or []
+                all_citations.extend(pres.get("citations", []))
+                all_citations.extend(d.get("url", "") for d in (tres or []) if d.get("url"))
+                yield sse({"type": "progress", "step": batch_start + batch.index(sec) + 1,
+                            "total": total, "label": f"Xong research: {sec['title']}"})
+
+        yield sse({"type": "ai_start", "total": len(enabled)})
+        appended_html = ""
+
+        for i, section in enumerate(enabled):
+            yield sse({"type": "status",
+                        "message": f"AI đang viết phần {i+1}/{len(enabled)}: {section['title']}"})
+            ctx = filter_context(all_results, section)
+            tvpl_docs = all_tvpl.get(section["id"], [])
+            if tvpl_docs and is_legal_or_tax_section(section):
+                tvpl_text = format_tvpl_results(tvpl_docs)
+                if tvpl_text:
+                    ctx = tvpl_text + "\n\n" + ctx
+            section_citations = all_results.get(section["id"], {}).get("citations", [])
+            tvpl_urls = [d.get("url", "") for d in tvpl_docs if d.get("url")]
+            all_section_urls = section_citations + tvpl_urls
+            if all_section_urls:
+                url_list = "\n".join(f"[{j+1}] {u}" for j, u in enumerate(all_section_urls[:20]))
+                ctx = f"=== DANH SÁCH URL NGUỒN (dùng cho citation) ===\n{url_list}\n\n" + ctx
+
+            sec_html = ""
+            async for chunk in claude_stream_section(section, subject, ctx, mode, i + 1):
+                yield sse({"type": "chunk", "text": chunk})
+                sec_html += chunk
+                await asyncio.sleep(0)
+
+            appended_html += sec_html + "\n"
+            yield sse({"type": "ping"})
+
+        unique_urls = list(dict.fromkeys(all_citations))
+        yield sse({"type": "citations", "urls": unique_urls})
+        appended_html = linkify_citations(appended_html, list(dict.fromkeys(all_citations)))
+        appended_html = await verify_legal_refs(appended_html)
+        yield sse({"type": "done", "appended_html": appended_html})
+
+    return StreamingResponse(generate(), media_type="text/event-stream",
+                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.post("/regenerate-section")
+async def regenerate_section(request: Request, _user: str = Depends(auth)):
+    """Research + generate a single section and stream it back."""
+    body          = await request.json()
+    subject       = body.get("subject", "").strip()
+    mode          = body.get("mode", "sector")
+    section_id    = body.get("section_id", "s1")
+    section_title = body.get("section_title", "")
+    section_subs  = body.get("section_subs", [])
+    sonar         = body.get("sonar_model", "sonar")
+
+    if not subject or not section_title:
+        raise HTTPException(400, "Missing subject or section_title")
+
+    section = {"id": section_id, "title": section_title, "sub": section_subs, "enabled": True}
+
+    async def generate():
+        def sse(data: dict) -> str:
+            return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+        yield sse({"type": "status", "message": f"Đang nghiên cứu: {section_title}"})
+
+        pres, tres = await asyncio.gather(
+            perplexity_search(build_query(section, subject, mode), sonar),
+            tvpl_search(build_tvpl_query(section, subject, mode)) if is_legal_or_tax_section(section) else _empty(),
+        )
+        all_citations = list(pres.get("citations", []))
+        all_citations.extend(d.get("url", "") for d in (tres or []) if d.get("url"))
+
+        yield sse({"type": "status", "message": f"AI đang viết: {section_title}"})
+
+        ctx = pres.get("text", "")
+        if tres and is_legal_or_tax_section(section):
+            tvpl_text = format_tvpl_results(tres)
+            if tvpl_text:
+                ctx = tvpl_text + "\n\n" + ctx
+        all_section_urls = pres.get("citations", []) + [d.get("url","") for d in (tres or []) if d.get("url")]
+        if all_section_urls:
+            url_list = "\n".join(f"[{j+1}] {u}" for j, u in enumerate(all_section_urls[:20]))
+            ctx = f"=== DANH SÁCH URL NGUỒN (dùng cho citation) ===\n{url_list}\n\n" + ctx
+
+        sec_html = ""
+        async for chunk in claude_stream_section(section, subject, ctx, mode, 1):
+            yield sse({"type": "chunk", "text": chunk})
+            sec_html += chunk
+            await asyncio.sleep(0)
+
+        unique_urls = list(dict.fromkeys(all_citations))
+        yield sse({"type": "citations", "urls": unique_urls})
+        sec_html = linkify_citations(sec_html, unique_urls)
+        sec_html = await verify_legal_refs(sec_html)
+        yield sse({"type": "done", "section_html": sec_html, "section_title": section_title})
+
+    return StreamingResponse(generate(), media_type="text/event-stream",
+                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
 # ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health(_user: str = Depends(auth)):
@@ -1176,6 +1332,8 @@ body.dark .sec-card input[type=text]{background:transparent}
       <button id="btn-slides" onclick="doSlides()" class="btn btn-gray">📑 Slides PPTX</button>
       <button id="btn-docx" onclick="doDocx()" class="btn btn-gray">📄 Word</button>
       <button onclick="openReports()" class="btn btn-gray">📂 Báo cáo đã lưu</button>
+      <button onclick="openAppendModal()" class="btn btn-gray">➕ Bổ sung</button>
+      <button id="btn-regen-hint" class="btn btn-gray" onclick="toggleRegenMode()" title="Bật chế độ regenerate từng section">🔄 Regenerate</button>
       <div class="flex-1"></div>
       <button onclick="chgFont(-1)" class="btn btn-gray font-bold">A−</button>
       <button onclick="chgFont(1)"  class="btn btn-gray font-bold">A+</button>
@@ -1530,6 +1688,7 @@ function finishReport(subject) {
   buildTOC();
   buildSources();
   setupScroll();
+  if (regenMode) addRegenButtons();
   window.scrollTo({top: 0, behavior: 'smooth'});
 }
 
@@ -1808,8 +1967,264 @@ function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
 document.querySelectorAll('[id^="modal-"]').forEach(m =>
   m.addEventListener('click', e => { if (e.target === m) closeModal(m.id); }));
 
+
+<!-- ── Append Sections Modal ─────────────────────────────────── -->
+<div id="modal-append" class="fixed inset-0 bg-black/50 z-50 hidden flex items-center justify-center">
+  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-lg mx-4 max-h-[85vh] flex flex-col"
+       style="background:var(--surface);color:var(--text)">
+    <div class="p-5 border-b flex items-center justify-between" style="border-color:var(--border)">
+      <div>
+        <h2 class="font-bold text-lg">➕ Bổ sung sections vào báo cáo</h2>
+        <p class="text-xs mt-0.5" style="color:var(--muted)">Chọn section chưa có để generate thêm</p>
+      </div>
+      <button onclick="closeModal('modal-append')" class="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
+    </div>
+    <div id="append-section-list" class="flex-1 overflow-y-auto p-5 space-y-2"></div>
+    <div class="p-5 border-t flex gap-3 items-center" style="border-color:var(--border)">
+      <button onclick="runAppendSections()"
+        class="px-5 py-2.5 rounded-xl text-sm font-semibold text-white"
+        style="background:#028a39">
+        ➕ Generate sections đã chọn
+      </button>
+      <span id="append-status" class="text-sm" style="color:var(--muted)"></span>
+    </div>
+  </div>
+</div>
+
+<script>
+
+// ── Append Sections ───────────────────────────────────────────
+let appendAbortCtrl = null;
+
+function openAppendModal() {
+  if (!reportHtml) { alert('Chưa có báo cáo'); return; }
+  const allSecs = sections.length ? sections : (mode === 'sector' ? [] : []);
+  const subject = document.getElementById('rpt-title').textContent.replace('Phân Tích Thuế — ', '');
+
+  // Detect which sections already exist in the report
+  const content = document.getElementById('report-content').innerHTML;
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(content, 'text/html');
+  const headings = [...doc.querySelectorAll('h2')].map(h => h.textContent.toLowerCase());
+
+  const list = document.getElementById('append-section-list');
+  list.innerHTML = '';
+  document.getElementById('append-status').textContent = '';
+
+  allSecs.forEach(sec => {
+    const exists = headings.some(h => h.includes(sec.title.toLowerCase()));
+    const div = document.createElement('div');
+    div.className = 'flex items-center gap-3 p-3 rounded-xl border transition-all ' +
+      (exists ? 'opacity-40' : 'hover:border-green-400');
+    div.style.borderColor = 'var(--border)';
+    div.innerHTML = `
+      <input type="checkbox" id="app-${esc(sec.id)}" value="${esc(sec.id)}" ${exists ? 'disabled' : ''}
+        class="w-4 h-4 accent-green-600">
+      <label for="app-${esc(sec.id)}" class="flex-1 text-sm font-medium ${exists ? 'line-through' : 'cursor-pointer'}">
+        ${esc(sec.title)}
+        ${exists ? '<span class="ml-1 text-xs opacity-60">(đã có)</span>' : ''}
+      </label>`;
+    list.appendChild(div);
+  });
+
+  if (!allSecs.length) {
+    list.innerHTML = '<p class="text-sm text-center py-4" style="color:var(--muted)">Không có sections để bổ sung</p>';
+  }
+  openModal('modal-append');
+}
+
+async function runAppendSections() {
+  const subject = document.getElementById('rpt-title').textContent.replace('Phân Tích Thuế — ', '');
+  const checked = [...document.querySelectorAll('#append-section-list input:checked')].map(el => el.value);
+  if (!checked.length) { alert('Chưa chọn section nào'); return; }
+
+  const selectedSections = sections.filter(s => checked.includes(s.id))
+    .map((s, i) => ({...s, enabled: true}));
+
+  const statusEl = document.getElementById('append-status');
+  statusEl.textContent = '⏳ Đang generate...';
+
+  if (appendAbortCtrl) appendAbortCtrl.abort();
+  appendAbortCtrl = new AbortController();
+
+  let appendedHtml = '';
+  try {
+    const resp = await fetch('/append-sections', {
+      method: 'POST',
+      headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subject, mode, sections: selectedSections }),
+      signal: appendAbortCtrl.signal,
+    });
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const evt = JSON.parse(line.slice(6));
+          if (evt.type === 'chunk') appendedHtml += evt.text;
+          if (evt.type === 'status') statusEl.textContent = evt.message;
+          if (evt.type === 'done') appendedHtml = evt.appended_html || appendedHtml;
+          if (evt.type === 'citations') citations = citations.concat(evt.urls || []);
+        } catch(e) {}
+      }
+    }
+
+    // Append to live report
+    const content = document.getElementById('report-content');
+    const tempDiv = document.createElement('div');
+    tempDiv.innerHTML = appendedHtml;
+    content.appendChild(tempDiv);
+
+    reportHtml += '\n' + appendedHtml;
+    buildTOC();
+    buildSources();
+    closeModal('modal-append');
+    statusEl.textContent = '✅ Đã bổ sung ' + selectedSections.length + ' sections';
+
+  } catch(e) {
+    if (e.name !== 'AbortError') statusEl.textContent = '❌ Lỗi: ' + e.message;
+  }
+}
+
+// ── Regenerate Section ────────────────────────────────────────
+let regenMode = false;
+
+function toggleRegenMode() {
+  regenMode = !regenMode;
+  const btn = document.getElementById('btn-regen-hint');
+  if (regenMode) {
+    btn.style.background = '#028a39';
+    btn.style.color = 'white';
+    btn.title = 'Click vào section trong báo cáo để regenerate. Click lại để tắt.';
+    addRegenButtons();
+  } else {
+    btn.style.background = '';
+    btn.style.color = '';
+    btn.title = 'Bật chế độ regenerate từng section';
+    removeRegenButtons();
+  }
+}
+
+function addRegenButtons() {
+  const content = document.getElementById('report-content');
+  content.querySelectorAll('h2').forEach(h2 => {
+    if (h2.querySelector('.regen-btn')) return;
+    h2.style.position = 'relative';
+    const btn = document.createElement('button');
+    btn.className = 'regen-btn no-print';
+    btn.textContent = '🔄';
+    btn.title = 'Regenerate section này';
+    btn.style.cssText = 'position:absolute;right:0;top:50%;transform:translateY(-50%);' +
+      'background:#f3f4f6;border:1px solid #d1d5db;border-radius:.5rem;' +
+      'padding:.2rem .5rem;font-size:.8rem;cursor:pointer;opacity:.7;' +
+      'transition:opacity .2s';
+    btn.onmouseenter = () => btn.style.opacity = '1';
+    btn.onmouseleave = () => btn.style.opacity = '.7';
+    btn.onclick = (e) => { e.stopPropagation(); confirmRegenSection(h2); };
+    h2.appendChild(btn);
+  });
+}
+
+function removeRegenButtons() {
+  document.querySelectorAll('.regen-btn').forEach(b => b.remove());
+  document.querySelectorAll('#report-content h2').forEach(h2 => h2.style.position = '');
+}
+
+async function confirmRegenSection(h2El) {
+  const title = h2El.textContent.replace('🔄', '').trim();
+  if (!confirm(`Regenerate lại section này?\n"${title}"\n\nNội dung cũ sẽ bị thay thế.`)) return;
+
+  const subject = document.getElementById('rpt-title').textContent.replace('Phân Tích Thuế — ', '');
+  const sec = sections.find(s => title.toLowerCase().includes(s.title.toLowerCase()));
+  if (!sec) { alert('Không tìm thấy section config. Thử regenerate từ đầu.'); return; }
+
+  // Show inline spinner
+  const spinner = document.createElement('span');
+  spinner.textContent = ' ⏳ Đang regenerate...';
+  spinner.className = 'regen-spinner text-sm';
+  spinner.style.color = '#028a39';
+  h2El.appendChild(spinner);
+
+  let newHtml = '';
+  try {
+    const resp = await fetch('/regenerate-section', {
+      method: 'POST',
+      headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        subject, mode,
+        section_id: sec.id,
+        section_title: sec.title,
+        section_subs: sec.sub || [],
+      }),
+    });
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const evt = JSON.parse(line.slice(6));
+          if (evt.type === 'chunk') newHtml += evt.text;
+          if (evt.type === 'done') newHtml = evt.section_html || newHtml;
+          if (evt.type === 'citations') citations = citations.concat(evt.urls || []);
+        } catch(e) {}
+      }
+    }
+
+    // Replace section in DOM: from this h2 to the next h2
+    replaceSectionInDOM(h2El, newHtml);
+
+    // Update reportHtml
+    reportHtml = document.getElementById('report-content').innerHTML;
+    buildTOC();
+    buildSources();
+
+  } catch(e) {
+    alert('Lỗi regenerate: ' + e.message);
+    spinner.remove();
+  }
+}
+
+function replaceSectionInDOM(h2El, newSectionHtml) {
+  const content = document.getElementById('report-content');
+  // Collect nodes from h2El up to (but not including) the next h2
+  const toRemove = [h2El];
+  let node = h2El.nextSibling;
+  while (node && !(node.nodeType === 1 && node.tagName === 'H2')) {
+    toRemove.push(node);
+    node = node.nextSibling;
+  }
+  // Insert new HTML before h2El
+  const tempDiv = document.createElement('div');
+  tempDiv.innerHTML = newSectionHtml;
+  toRemove.forEach(n => n.remove());
+  // Insert all children of tempDiv before `node` (next h2 or end)
+  const refNode = node || null;
+  [...tempDiv.childNodes].forEach(child => content.insertBefore(child.cloneNode(true), refNode));
+}
+
+</script>
+
+<script>
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') closeModal('modal-reports');
+  if (e.key === 'Escape') { closeModal('modal-reports'); closeModal('modal-append'); }
 });
 </script>
 </body>
