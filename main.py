@@ -19,6 +19,8 @@ from bs4 import BeautifulSoup
 PERPLEXITY_KEY = os.getenv("PERPLEXITY_API_KEY", "")
 ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL   = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5")
+GAMMA_API_KEY  = os.getenv("GAMMA_API_KEY", "")
+GAMMA_API_URL  = "https://public-api.gamma.app/v1.0/generations"
 APP_USER       = os.getenv("APP_USERNAME", "hoang")
 APP_PASS       = os.getenv("APP_PASSWORD", "taxsector2026")
 REPORTS_DIR    = Path(os.getenv("REPORTS_DIR", "./reports"))
@@ -517,6 +519,118 @@ def linkify_citations(html: str, citations: list) -> str:
     # Only replace [N] that are NOT already inside an <a> tag
     return re.sub(r'(?<!href=")\[(\d+)\](?![^<]*</a>)', replacer, html)
 
+# ── Gamma API ────────────────────────────────────────────────────────────────
+async def create_gamma_slides(subject: str, html_content: str) -> dict:
+    """Call Gamma API to create slides from report HTML. Returns {gammaUrl, pptxUrl}."""
+    import aiohttp as _aiohttp
+
+    if not GAMMA_API_KEY:
+        raise Exception("GAMMA_API_KEY not configured")
+
+    plain_text = re.sub(r'<[^>]+>', ' ', html_content)
+    plain_text = re.sub(r'\s+', ' ', plain_text).strip()[:80000]
+
+    payload = {
+        "inputText": f"# {subject}\n\n{plain_text}",
+        "textMode": "condense",
+        "format": "presentation",
+        "numCards": 60,
+        "cardSplit": "auto",
+        "additionalInstructions": (
+            "Phân tích nội dung một cách chi tiết và mạch lạc. "
+            "Vẽ các biểu đồ cần thiết. "
+            "Sử dụng tối đa image phù hợp để minh hoạ nội dung một cách phù hợp nhất. "
+            "Trình bày rõ ràng, minh họa tối đa bằng các sơ đồ, "
+            "sao cho thật dễ hiểu với các chuyên gia tư vấn Thuế, "
+            "kể cả những người mới đi làm hay đã đi làm lâu năm."
+        ),
+        "folderIds": ["m1b4lf5j12yd7ck"],
+        "exportAs": "pptx",
+        "textOptions": {
+            "amount": "extensive",
+            "tone": "professional, analytical",
+            "audience": "tax professionals, business executives",
+            "language": "vi",
+        },
+        "imageOptions": {
+            "source": "aiGenerated",
+            "model": "imagen-4-pro",
+            "style": "photorealistic, professional, corporate",
+        },
+        "cardOptions": {
+            "dimensions": "16x9",
+            "headerFooter": {
+                "bottomRight": {"type": "cardNumber"},
+                "hideFromFirstCard": True,
+            },
+        },
+        "sharingOptions": {"externalAccess": "view"},
+    }
+    headers = {"Content-Type": "application/json", "X-API-KEY": GAMMA_API_KEY}
+
+    async with _aiohttp.ClientSession() as session:
+        async with session.post(GAMMA_API_URL, json=payload, headers=headers) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise Exception(f"Gamma API error {resp.status}: {text}")
+            data = await resp.json()
+            generation_id = data.get("generationId")
+            if not generation_id:
+                raise Exception(f"No generationId in response: {data}")
+
+        poll_url = f"{GAMMA_API_URL}/{generation_id}"
+        for _ in range(60):  # max 10 minutes
+            await asyncio.sleep(10)
+            async with session.get(poll_url, headers=headers) as resp:
+                if resp.status != 200:
+                    continue
+                result = await resp.json()
+                status = result.get("status")
+                if status == "completed":
+                    return {
+                        "gammaUrl": result.get("gammaUrl", ""),
+                        "pptxUrl":  result.get("pptxUrl", ""),
+                        "generationId": generation_id,
+                    }
+                elif status == "failed":
+                    raise Exception(f"Gamma generation failed: {result}")
+
+    raise Exception("Gamma generation timeout after 10 minutes")
+
+
+def inject_gamma_link(filename: str, gamma_url: str, pptx_url: str = None):
+    """Inject Gamma slides link into the saved report HTML (inside report-body)."""
+    path = REPORTS_DIR / filename
+    if not path.exists():
+        return
+
+    content = path.read_text(encoding="utf-8")
+
+    links_html = (
+        f'<div id="gamma-links" style="margin:1rem 0;padding:.75rem 1rem;'
+        f'background:#f0fdf4;border-radius:.5rem;border:1px solid #bbf7d0">'
+        f'<a href="{gamma_url}" target="_blank" rel="noopener" '
+        f'style="color:#028a39;font-weight:600;text-decoration:none;font-size:.95rem">'
+        f'🎬 Xem Slides (Gamma)</a>'
+    )
+    if pptx_url:
+        links_html += (
+            f' &nbsp;|&nbsp; '
+            f'<a href="{pptx_url}" target="_blank" rel="noopener" '
+            f'style="color:#028a39;font-weight:600;text-decoration:none;font-size:.95rem">'
+            f'⬇️ Tải PPTX</a>'
+        )
+    links_html += '</div>\n'
+
+    # Inject at start of report-body div so app's loadSavedReport picks it up
+    if '<div id="report-body">' in content:
+        content = content.replace('<div id="report-body">', '<div id="report-body">\n' + links_html, 1)
+    elif '<body>' in content:
+        content = content.replace('<body>', '<body>\n' + links_html, 1)
+
+    path.write_text(content, encoding="utf-8")
+
+
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 app = FastAPI(title="Tax Sector Research")
 
@@ -641,10 +755,11 @@ async def stream_report(request: Request, _user: str = Depends(auth)):
         # Save — append citations to report before saving
         try:
             if unique_urls:
-                refs_html = '<hr><h2>Nguồn tham khảo</h2><ol>'
-                for url in unique_urls[:50]:
-                    refs_html += f'<li><a href="{url}" target="_blank" rel="noopener">{url}</a></li>'
-                refs_html += '</ol>'
+                refs_html = '<hr><h2>Nguồn tham khảo</h2><div style="margin-top:.75rem">'
+                for i, url in enumerate(unique_urls[:50], 1):
+                    short = (url[:80] + '...') if len(url) > 80 else url
+                    refs_html += f'<div style="margin:.3rem 0;font-size:.875rem"><b>[{i}]</b> <a href="{url}" target="_blank" rel="noopener" style="color:#028a39">{short}</a></div>'
+                refs_html += '</div>'
                 full_html_with_refs = full_html + refs_html
             else:
                 full_html_with_refs = full_html
@@ -738,24 +853,43 @@ async def run_generate_job(job_id: str, subject: str, mode: str, sections_list: 
         full_html = linkify_citations(full_html, unique_citations)
 
         if unique_citations:
-            refs_html = '<hr><h2>Nguồn tham khảo</h2><ol>'
-            for url in unique_citations[:50]:
-                refs_html += f'<li><a href="{url}" target="_blank" rel="noopener">{url}</a></li>'
-            refs_html += '</ol>'
+            refs_html = '<hr><h2>Nguồn tham khảo</h2><div style="margin-top:.75rem">'
+            for i, url in enumerate(unique_citations[:50], 1):
+                short = (url[:80] + '...') if len(url) > 80 else url
+                refs_html += f'<div style="margin:.3rem 0;font-size:.875rem"><b>[{i}]</b> <a href="{url}" target="_blank" rel="noopener" style="color:#028a39">{short}</a></div>'
+            refs_html += '</div>'
             full_html = full_html + refs_html
 
         full_html = await verify_legal_refs(full_html)
 
-        job["progress"] = 97
+        job["progress"] = 95
         job["message"] = "💾 Đang lưu báo cáo..."
 
         filename = save_report(subject, full_html, citations=unique_citations)
 
-        job["status"] = "done"
+        # ── Phase 4: Gamma Slides ──────────────────────────────
+        if GAMMA_API_KEY:
+            job["progress"] = 97
+            job["message"] = "🎬 Đang tạo slides với Gamma (có thể mất 2-5 phút)..."
+            try:
+                gamma_result = await create_gamma_slides(subject, full_html)
+                gamma_url = gamma_result.get("gammaUrl", "")
+                pptx_url  = gamma_result.get("pptxUrl", "")
+                if gamma_url:
+                    inject_gamma_link(filename, gamma_url, pptx_url)
+                    job["gammaUrl"] = gamma_url
+                    job["pptxUrl"]  = pptx_url
+            except Exception as e:
+                print(f"[WARN] Gamma API failed: {e}")
+                job["gammaUrl"] = None
+
+        job["status"]   = "done"
         job["progress"] = 100
-        job["message"] = "✅ Hoàn thành!"
+        job["message"]  = "✅ Hoàn thành!" + (
+            " Slides đã sẵn sàng trên Gamma." if job.get("gammaUrl") else ""
+        )
         job["filename"] = filename
-        job["done_at"] = datetime.now().isoformat()
+        job["done_at"]  = datetime.now().isoformat()
 
     except Exception as e:
         job["status"] = "error"
@@ -1228,11 +1362,29 @@ async def run_append_job(job_id: str, subject: str, mode: str,
         new_filename = make_append_filename(original_file) if original_file else None
         filename = save_report(subject, combined_html, citations=unique_citations, filename_override=new_filename)
 
-        job["status"] = "done"
+        # ── Phase 4: Gamma Slides ──────────────────────────────
+        if GAMMA_API_KEY:
+            job["progress"] = 97
+            job["message"] = "🎬 Đang tạo slides với Gamma (có thể mất 2-5 phút)..."
+            try:
+                gamma_result = await create_gamma_slides(subject, combined_html)
+                gamma_url = gamma_result.get("gammaUrl", "")
+                pptx_url  = gamma_result.get("pptxUrl", "")
+                if gamma_url:
+                    inject_gamma_link(filename, gamma_url, pptx_url)
+                    job["gammaUrl"] = gamma_url
+                    job["pptxUrl"]  = pptx_url
+            except Exception as e:
+                print(f"[WARN] Gamma API failed: {e}")
+                job["gammaUrl"] = None
+
+        job["status"]   = "done"
         job["progress"] = 100
-        job["message"] = "✅ Báo cáo bổ sung đã lưu!"
+        job["message"]  = "✅ Báo cáo bổ sung đã lưu!" + (
+            " Slides đã sẵn sàng trên Gamma." if job.get("gammaUrl") else ""
+        )
         job["filename"] = filename
-        job["done_at"] = datetime.now().isoformat()
+        job["done_at"]  = datetime.now().isoformat()
 
     except Exception as e:
         job["status"] = "error"
@@ -1802,43 +1954,6 @@ function toggleDark() {
   if (b2) b2.textContent = icon;
 }
 
-async function doSlides() {
-  if (!reportHtml) { alert('Chưa có báo cáo để xuất'); return; }
-  const subject =
-    document.getElementById('rpt-title')?.textContent?.replace('Phân Tích Thuế —', '').trim() ||
-    (currentFile || '').replace('.html', '').replace(/-a\d+$/, '').replace(/-\d{8}-?\d{0,4}$/, '').trim() ||
-    'BaoCao';
-  const btn = document.getElementById('btn-slides');
-  btn.textContent = '⏳ Đang tạo PPTX...';
-  btn.disabled = true;
-  try {
-    const r = await fetch('/slides', {
-      method: 'POST',
-      headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ html: reportHtml, subject }),
-    });
-    if (r.ok) {
-      const blob = await r.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = (currentFile || subject).replace('.html', '') + '.pptx';
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    } else {
-      const errText = await r.text().catch(() => 'Lỗi không xác định');
-      alert('Không xuất được PPTX: ' + errText);
-    }
-  } catch(e) {
-    alert('Lỗi kết nối: ' + e.message);
-  } finally {
-    btn.textContent = '📑 Slides PPTX';
-    btn.disabled = false;
-  }
-}
-
 async function doDocx() {
   const btn = document.getElementById('btn-docx');
   if (!reportHtml) { alert('Chưa có báo cáo để xuất'); return; }
@@ -1989,6 +2104,11 @@ async function loadSavedReport(name) {
     document.getElementById('report-content').style.fontSize = fontSize + 'px';
     document.getElementById('toc-wrap').classList.add('hidden');
     document.getElementById('src-wrap').classList.add('hidden');
+
+    // Show Gamma link if embedded in the report
+    const gammaDiv = document.getElementById('gamma-links');
+    if (gammaDiv) gammaDiv.style.display = 'block';
+
     buildTOC();
     buildSources();
     setupScroll();
@@ -2048,12 +2168,19 @@ async function pollJob(job_id) {
     document.getElementById('gen-status-msg').textContent = job.message;
     document.getElementById('gen-subject-label').textContent = job.subject;
 
+    // Gamma phase — purple progress bar
+    if (job.message && job.message.includes('Gamma')) {
+      document.getElementById('gen-progress-bar').style.background = '#6366f1';
+    } else {
+      document.getElementById('gen-progress-bar').style.background = 'var(--brand)';
+    }
+
     if (job.status === 'done') {
       clearInterval(pollTimer);
       pollTimer = null;
       localStorage.removeItem('current_job_id');
       await loadReportsCount();
-      showJobDone(job.filename, job.subject);
+      showJobDone(job);
       showPhase('setup');
     }
     if (job.status === 'error') {
@@ -2075,24 +2202,37 @@ function cancelJob() {
   showPhase('setup');
 }
 
-function showJobDone(filename, subject) {
-  const toast = document.createElement('div');
-  toast.innerHTML = `
-    <div style="position:fixed;bottom:2rem;right:2rem;z-index:999;
+function showJobDone(job) {
+  const filename = job.filename || '';
+  const subject  = job.subject  || '';
+  let toastHtml = `
+    <div style="position:fixed;bottom:2rem;right:2rem;z-index:9999;
                 background:#fff;border:1px solid #bbf7d0;border-radius:.75rem;
-                padding:1rem 1.5rem;box-shadow:0 4px 20px rgba(0,0,0,.1);
-                max-width:320px">
-      <p style="font-weight:600;font-size:.875rem;margin-bottom:.25rem">✅ Báo cáo đã hoàn thành!</p>
-      <p style="font-size:.875rem;margin-bottom:.75rem;color:var(--muted)">${esc(subject)}</p>
-      <button onclick="loadSavedReport('${esc(filename)}');this.closest('div').parentElement.remove()"
-        style="width:100%;font-size:.875rem;padding:.5rem;border-radius:.5rem;
-               color:#fff;font-weight:500;background:var(--brand);border:none;cursor:pointer">
-        Mở báo cáo →
-      </button>
-    </div>
-  `;
+                padding:1rem 1.5rem;box-shadow:0 4px 20px rgba(0,0,0,.1);max-width:340px">
+      <p style="font-weight:600;font-size:.9rem;margin-bottom:.5rem">✅ Báo cáo hoàn thành!</p>
+      <p style="font-size:.8rem;color:var(--muted);margin-bottom:.75rem">${esc(subject)}</p>
+      <div style="display:flex;gap:.5rem;flex-wrap:wrap">
+        <button onclick="loadSavedReport('${esc(filename)}');this.closest('div').parentElement.remove()"
+          style="flex:1;font-size:.8rem;padding:.4rem .75rem;border-radius:.5rem;
+                 background:var(--brand);color:#fff;border:none;cursor:pointer;font-weight:600">
+          📄 Mở báo cáo
+        </button>`;
+  if (job.gammaUrl) {
+    toastHtml += `
+        <a href="${esc(job.gammaUrl)}" target="_blank"
+          style="flex:1;font-size:.8rem;padding:.4rem .75rem;border-radius:.5rem;
+                 background:#6366f1;color:#fff;text-decoration:none;
+                 text-align:center;font-weight:600">
+          🎬 Xem Slides
+        </a>`;
+  }
+  toastHtml += `
+      </div>
+    </div>`;
+  const toast = document.createElement('div');
+  toast.innerHTML = toastHtml;
   document.body.appendChild(toast);
-  setTimeout(() => toast.remove(), 15000);
+  setTimeout(() => toast.remove(), 20000);
 }
 
 async function loadReportsCount() {
@@ -2611,7 +2751,6 @@ function replaceSectionInDOM(h2El, newSectionHtml) {
     <!-- Toolbar -->
     <div class="no-print flex flex-wrap items-center gap-2 mb-4 surface rounded-xl p-3 shadow-sm sticky top-2 z-40">
       <button onclick="window.print()" class="btn btn-gray">🖨️ In/PDF</button>
-      <button id="btn-slides" onclick="doSlides()" class="btn btn-gray">📑 Slides PPTX</button>
       <button id="btn-docx" onclick="doDocx()" class="btn btn-gray">📄 Word</button>
       <button onclick="openReports()" class="btn btn-gray">📂 Báo cáo đã lưu</button>
       <button onclick="openAppendModal()" class="btn btn-gray">➕ Bổ sung</button>
