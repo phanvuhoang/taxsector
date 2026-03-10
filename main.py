@@ -777,11 +777,14 @@ async def export_docx(request: Request, _user: str = Depends(auth)):
         doc.save(buf)
         buf.seek(0)
 
-        safe = re.sub(r'[^\w\s-]', '', subject)[:50].strip().replace(' ', '_')
+        safe_ascii = re.sub(r'[^\x01-\x7F]', '', subject)[:50].strip().replace(' ', '_') or 'BaoCao'
+        from urllib.parse import quote as _quote
+        safe_utf8 = _quote(f'PhanTichThue_{subject[:50]}.docx', safe='')
+        cd = f'attachment; filename="PhanTichThue_{safe_ascii}.docx"; filename*=UTF-8''{safe_utf8}'
         return StreamingResponse(
             buf,
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            headers={"Content-Disposition": f'attachment; filename="PhanTichThue_{safe}.docx"'},
+            headers={"Content-Disposition": cd},
         )
 
     except HTTPException:
