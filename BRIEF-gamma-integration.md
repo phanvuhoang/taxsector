@@ -329,8 +329,52 @@ App đọc từ env, không hardcode trong code.
 5. Toast có 2 nút: "📄 Mở báo cáo" + "🎬 Xem Slides"
 6. Mở báo cáo → TOC đầu trang có link "🎬 Xem Slides (Gamma)" + "⬇️ Tải PPTX"
 
+---
+
+## Fix đi kèm: Reference list đánh số [1][2][3]...
+
+### Vấn đề
+Phần "Nguồn tham khảo" cuối báo cáo dùng `<ol><li>` nhưng CSS reset
+khiến số thứ tự không hiển thị.
+
+### Fix cả 2 chỗ tạo `refs_html` trong backend:
+
+**Chỗ 1** — stream endpoint, tìm đoạn dùng `unique_urls`:
+```python
+# CŨ:
+refs_html = '<hr><h2>Nguồn tham khảo</h2><ol>'
+for url in unique_urls[:50]:
+    refs_html += f'<li><a href="{url}" target="_blank" rel="noopener">{url}</a></li>'
+refs_html += '</ol>'
+
+# MỚI:
+refs_html = '<hr><h2>Nguồn tham khảo</h2><div style="margin-top:.75rem">'
+for i, url in enumerate(unique_urls[:50], 1):
+    short = (url[:80] + '...') if len(url) > 80 else url
+    refs_html += f'<div style="margin:.3rem 0;font-size:.875rem"><b>[{i}]</b> <a href="{url}" target="_blank" rel="noopener" style="color:#028a39">{short}</a></div>'
+refs_html += '</div>'
+```
+
+**Chỗ 2** — background job `run_generate_job()`, tìm đoạn dùng `unique_citations`:
+```python
+# CŨ:
+refs_html = '<hr><h2>Nguồn tham khảo</h2><ol>'
+for url in unique_citations[:50]:
+    refs_html += f'<li><a href="{url}" target="_blank" rel="noopener">{url}</a></li>'
+refs_html += '</ol>'
+
+# MỚI:
+refs_html = '<hr><h2>Nguồn tham khảo</h2><div style="margin-top:.75rem">'
+for i, url in enumerate(unique_citations[:50], 1):
+    short = (url[:80] + '...') if len(url) > 80 else url
+    refs_html += f'<div style="margin:.3rem 0;font-size:.875rem"><b>[{i}]</b> <a href="{url}" target="_blank" rel="noopener" style="color:#028a39">{short}</a></div>'
+refs_html += '</div>'
+```
+
+---
+
 ## Commit message
-`feat: Gamma API integration — auto-create slides after report generation`
+`feat: Gamma API integration + fix reference list numbering`
 
 ## Sau khi xong
 Xoá BRIEF-gamma-integration.md rồi push.
