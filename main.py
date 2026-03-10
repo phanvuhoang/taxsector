@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tax Sector Research Tool — Single-file FastAPI application"""
 
-import os, asyncio, json, re, io, secrets, time, unicodedata
+import os, asyncio, json, re, io, secrets, time, unicodedata, uuid
 from datetime import datetime
 from pathlib import Path
 from typing import AsyncGenerator
@@ -500,6 +500,9 @@ def linkify_citations(html: str, citations: list) -> str:
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 app = FastAPI(title="Tax Sector Research")
 
+# ── In-memory job store ───────────────────────────────────────────────────────
+jobs: dict[str, dict] = {}
+
 # ── SSE stream endpoint ───────────────────────────────────────────────────────
 @app.post("/stream")
 async def stream_report(request: Request, _user: str = Depends(auth)):
@@ -641,6 +644,160 @@ async def stream_report(request: Request, _user: str = Depends(auth)):
             "Connection": "keep-alive",
         },
     )
+
+# ── Background job generation ─────────────────────────────────────────────────
+async def run_generate_job(job_id: str, subject: str, mode: str, sections_list: list, sonar: str = "sonar"):
+    job = jobs[job_id]
+    enabled = [s for s in sections_list if s.get("enabled", True)]
+    total = len(enabled)
+    try:
+        job["status"] = "running"
+
+        # Phase 1: Research (Perplexity + TVPL)
+        all_results: dict = {}
+        all_tvpl: dict = {}
+        all_citations: list = []
+
+        for batch_start in range(0, total, 4):
+            batch = enabled[batch_start:batch_start + 4]
+            pct = 5 + int((batch_start / max(total, 1)) * 40)
+            job["progress"] = pct
+            job["message"] = f"🔍 Đang research: {batch[0]['title']}..."
+
+            perplexity_tasks = [
+                perplexity_search(build_query(s, subject, mode), sonar)
+                for s in batch
+            ]
+            tvpl_tasks = [
+                tvpl_search(build_tvpl_query(s, subject, mode))
+                if is_legal_or_tax_section(s)
+                else _empty()
+                for s in batch
+            ]
+            perplexity_results, tvpl_results = await asyncio.gather(
+                asyncio.gather(*perplexity_tasks),
+                asyncio.gather(*tvpl_tasks),
+            )
+            for sec, pres, tres in zip(batch, perplexity_results, tvpl_results):
+                all_results[sec["id"]] = pres
+                all_tvpl[sec["id"]] = tres or []
+                all_citations.extend(pres.get("citations", []))
+                all_citations.extend(d.get("url", "") for d in (tres or []) if d.get("url"))
+
+        # Phase 2: Generate sections with Claude
+        all_html_parts = []
+        for i, section in enumerate(enabled):
+            pct = 45 + int((i / max(total, 1)) * 45)
+            job["progress"] = pct
+            job["message"] = f"✍️ Đang viết phần {i+1}/{total}: {section['title']}"
+
+            ctx = filter_context(all_results, section)
+            tvpl_docs = all_tvpl.get(section["id"], [])
+            if tvpl_docs and is_legal_or_tax_section(section):
+                tvpl_text = format_tvpl_results(tvpl_docs)
+                if tvpl_text:
+                    ctx = tvpl_text + "\n\n" + ctx
+            section_citations = all_results.get(section["id"], {}).get("citations", [])
+            tvpl_urls = [d.get("url", "") for d in tvpl_docs if d.get("url")]
+            all_section_urls = section_citations + tvpl_urls
+            if all_section_urls:
+                url_list = "\n".join(f"[{j+1}] {u}" for j, u in enumerate(all_section_urls[:20]))
+                ctx = f"=== DANH SÁCH URL NGUỒN (dùng cho citation) ===\n{url_list}\n\n" + ctx
+
+            sec_html = ""
+            async for chunk in claude_stream_section(section, subject, ctx, mode, i + 1):
+                sec_html += chunk
+            all_html_parts.append(sec_html)
+
+        # Phase 3: Post-process & Save
+        job["progress"] = 92
+        job["message"] = "🔎 Đang kiểm tra văn bản pháp luật..."
+
+        unique_citations = list(dict.fromkeys(all_citations))
+        full_html = "\n".join(all_html_parts)
+        full_html = linkify_citations(full_html, unique_citations)
+
+        if unique_citations:
+            refs_html = '<hr><h2>Nguồn tham khảo</h2><ol>'
+            for url in unique_citations[:50]:
+                refs_html += f'<li><a href="{url}" target="_blank" rel="noopener">{url}</a></li>'
+            refs_html += '</ol>'
+            full_html = full_html + refs_html
+
+        full_html = await verify_legal_refs(full_html)
+
+        job["progress"] = 97
+        job["message"] = "💾 Đang lưu báo cáo..."
+
+        filename = save_report(subject, full_html)
+
+        job["status"] = "done"
+        job["progress"] = 100
+        job["message"] = "✅ Hoàn thành!"
+        job["filename"] = filename
+        job["done_at"] = datetime.now().isoformat()
+
+    except Exception as e:
+        job["status"] = "error"
+        job["message"] = f"❌ Lỗi: {str(e)}"
+        job["error"] = str(e)
+        import traceback
+        traceback.print_exc()
+
+
+@app.post("/generate")
+async def generate_report(request: Request, _user: str = Depends(auth)):
+    body = await request.json()
+    subject       = body.get("subject", "").strip()
+    mode          = body.get("mode", "sector")
+    sections_body = body.get("sections", [])
+    sonar         = body.get("sonar_model", "sonar")
+
+    if not subject:
+        raise HTTPException(400, "subject required")
+
+    job_id = str(uuid.uuid4())[:8]
+    jobs[job_id] = {
+        "status": "pending",
+        "progress": 0,
+        "message": "Đang khởi tạo...",
+        "subject": subject,
+        "mode": mode,
+        "filename": None,
+        "error": None,
+        "created_at": datetime.now().isoformat(),
+        "done_at": None,
+    }
+
+    asyncio.create_task(run_generate_job(job_id, subject, mode, sections_body, sonar))
+
+    return {"job_id": job_id}
+
+
+@app.get("/job/{job_id}")
+async def get_job(job_id: str, _user: str = Depends(auth)):
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    return job
+
+
+async def cleanup_old_jobs():
+    while True:
+        await asyncio.sleep(3600)
+        cutoff = datetime.now().timestamp() - 86400
+        to_delete = [
+            jid for jid, j in list(jobs.items())
+            if datetime.fromisoformat(j["created_at"]).timestamp() < cutoff
+        ]
+        for jid in to_delete:
+            del jobs[jid]
+
+
+@app.on_event("startup")
+async def startup():
+    asyncio.create_task(cleanup_old_jobs())
+
 
 # ── Default sections ──────────────────────────────────────────────────────────
 @app.get("/default-sections")
@@ -1226,6 +1383,8 @@ let currentFile = null;
 let fontSize = 16;
 let dark = false;
 let abortCtrl = null;
+let pollTimer = null;
+let currentJobId = null;
 
 // ── Auth ──────────────────────────────────────────────────────
 async function doLogin() {
@@ -1257,6 +1416,30 @@ async function doLogin() {
 // ── Init ──────────────────────────────────────────────────────
 async function init() {
   await loadSections();
+  await loadReportsCount();
+
+  // Resume polling if there's an active job from a previous session
+  const savedJobId = localStorage.getItem('current_job_id');
+  if (savedJobId) {
+    try {
+      const r = await fetch(`/job/${savedJobId}`, {headers: {Authorization: AUTH}});
+      if (r.ok) {
+        const job = await r.json();
+        if (job.status === 'running' || job.status === 'pending') {
+          currentJobId = savedJobId;
+          document.getElementById('gen-subject-label').textContent = job.subject;
+          document.getElementById('gen-progress-bar').style.width = job.progress + '%';
+          document.getElementById('gen-status-msg').textContent = job.message;
+          showPhase('generating');
+          startPolling(savedJobId);
+        } else {
+          localStorage.removeItem('current_job_id');
+        }
+      } else {
+        localStorage.removeItem('current_job_id');
+      }
+    } catch(e) {}
+  }
 }
 
 // ── Mode ──────────────────────────────────────────────────────
@@ -1405,45 +1588,27 @@ async function startResearch() {
   if (!enabled.length) { alert('Vui lòng bật ít nhất một phần'); return; }
 
   const sonar = document.querySelector('input[name="sonar"]:checked').value;
-  showPhase('progress');
-  document.getElementById('prog-subject').textContent = subject;
   reportHtml = '';
   citations = [];
   currentFile = null;
-  document.getElementById('step-list').innerHTML = '';
-  document.getElementById('partial-body').innerHTML = '';
-  document.getElementById('partial-wrap').classList.add('hidden');
-
-  abortCtrl = new AbortController();
 
   try {
-    const res = await fetch('/stream', {
+    const resp = await fetch('/generate', {
       method: 'POST',
       headers: {Authorization: AUTH, 'Content-Type': 'application/json'},
       body: JSON.stringify({subject, mode, sections, sonar_model: sonar}),
-      signal: abortCtrl.signal,
     });
+    if (!resp.ok) { alert('Lỗi server: ' + resp.status); return; }
 
-    if (!res.ok) { showErr('Lỗi server: ' + res.status); return; }
-
-    const reader = res.body.getReader();
-    const dec = new TextDecoder();
-    let buf = '';
-
-    while (true) {
-      const {done, value} = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, {stream: true});
-      const lines = buf.split('\n');
-      buf = lines.pop();
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          try { handleEvt(JSON.parse(line.slice(6)), subject); } catch(e) {}
-        }
-      }
-    }
+    const { job_id } = await resp.json();
+    currentJobId = job_id;
+    document.getElementById('gen-subject-label').textContent = subject;
+    document.getElementById('gen-progress-bar').style.width = '0%';
+    document.getElementById('gen-status-msg').textContent = 'Đang khởi tạo...';
+    showPhase('generating');
+    startPolling(job_id);
   } catch(e) {
-    if (e.name !== 'AbortError') showErr('Lỗi kết nối: ' + e.message);
+    alert('Lỗi: ' + e.message);
   }
 }
 
@@ -1761,8 +1926,9 @@ function newReport() {
   if (currentFile || reportHtml) {
     if (!confirm('Bắt đầu báo cáo mới? Báo cáo hiện tại vẫn được lưu.')) return;
   }
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   showPhase('setup');
-  reportHtml = ''; currentFile = null; citations = [];
+  reportHtml = ''; currentFile = null; citations = []; currentJobId = null;
   document.getElementById('step-list').innerHTML = '';
   document.getElementById('partial-body').innerHTML = '';
   document.getElementById('report-content').innerHTML = '';
@@ -1773,13 +1939,84 @@ function newReport() {
 
 // ── Helpers ───────────────────────────────────────────────────
 function showPhase(p) {
-  ['setup','progress','report'].forEach(x =>
-    document.getElementById('ph-' + x).classList.toggle('hidden', x !== p));
+  ['setup','progress','generating','report'].forEach(x =>
+    document.getElementById('ph-' + x)?.classList.toggle('hidden', x !== p));
 }
 
 function showErr(msg) {
   document.getElementById('prog-status').textContent = '❌ ' + msg;
   document.getElementById('prog-bar').style.background = '#ef4444';
+}
+
+// ── Background job polling ─────────────────────────────────────
+function startPolling(job_id) {
+  localStorage.setItem('current_job_id', job_id);
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(() => pollJob(job_id), 3000);
+}
+
+async function pollJob(job_id) {
+  try {
+    const r = await fetch(`/job/${job_id}`, {headers: {Authorization: AUTH}});
+    const job = await r.json();
+    document.getElementById('gen-progress-bar').style.width = job.progress + '%';
+    document.getElementById('gen-status-msg').textContent = job.message;
+    document.getElementById('gen-subject-label').textContent = job.subject;
+
+    if (job.status === 'done') {
+      clearInterval(pollTimer);
+      pollTimer = null;
+      localStorage.removeItem('current_job_id');
+      await loadReportsCount();
+      showJobDone(job.filename, job.subject);
+      showPhase('setup');
+    }
+    if (job.status === 'error') {
+      clearInterval(pollTimer);
+      pollTimer = null;
+      localStorage.removeItem('current_job_id');
+      alert('Lỗi tạo báo cáo: ' + job.message);
+      showPhase('setup');
+    }
+  } catch(e) {
+    console.error('Poll error:', e);
+  }
+}
+
+function cancelJob() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  localStorage.removeItem('current_job_id');
+  currentJobId = null;
+  showPhase('setup');
+}
+
+function showJobDone(filename, subject) {
+  const toast = document.createElement('div');
+  toast.innerHTML = `
+    <div style="position:fixed;bottom:2rem;right:2rem;z-index:999;
+                background:#fff;border:1px solid #bbf7d0;border-radius:.75rem;
+                padding:1rem 1.5rem;box-shadow:0 4px 20px rgba(0,0,0,.1);
+                max-width:320px">
+      <p style="font-weight:600;font-size:.875rem;margin-bottom:.25rem">✅ Báo cáo đã hoàn thành!</p>
+      <p style="font-size:.875rem;margin-bottom:.75rem;color:var(--muted)">${esc(subject)}</p>
+      <button onclick="loadSavedReport('${esc(filename)}');this.closest('div').parentElement.remove()"
+        style="width:100%;font-size:.875rem;padding:.5rem;border-radius:.5rem;
+               color:#fff;font-weight:500;background:var(--brand);border:none;cursor:pointer">
+        Mở báo cáo →
+      </button>
+    </div>
+  `;
+  document.body.appendChild(toast);
+  setTimeout(() => toast.remove(), 15000);
+}
+
+async function loadReportsCount() {
+  try {
+    const r = await fetch('/reports', {headers: {Authorization: AUTH}});
+    const data = await r.json();
+    const badge = document.getElementById('reports-badge');
+    if (badge) badge.textContent = data.length ? `(${data.length})` : '';
+  } catch(e) {}
 }
 
 function openModal(id)  { document.getElementById(id).classList.remove('hidden'); }
@@ -2239,6 +2476,30 @@ function replaceSectionInDOM(h2El, newSectionHtml) {
     <div id="partial-wrap" class="surface rounded-xl p-5 hidden">
       <p class="font-medium text-green-700 mb-3 text-sm">📝 Đang tạo báo cáo...</p>
       <div id="partial-body" class="text-sm overflow-y-auto max-h-80"></div>
+    </div>
+  </div>
+
+  <!-- ── GENERATING PHASE (background job) ──────────────────── -->
+  <div id="ph-generating" class="hidden">
+    <div class="surface rounded-xl p-8 mb-4 shadow-sm text-center">
+      <div class="text-5xl mb-4">⏳</div>
+      <h2 class="text-xl font-bold mb-2">Đang tạo báo cáo</h2>
+      <p id="gen-subject-label" class="text-lg mb-6" style="color:var(--brand)"></p>
+      <div class="w-full max-w-md mx-auto bg-gray-100 rounded-full h-3 mb-3 overflow-hidden">
+        <div id="gen-progress-bar"
+             class="h-full rounded-full transition-all duration-500"
+             style="width:0%;background:var(--brand)"></div>
+      </div>
+      <p id="gen-status-msg" class="text-sm mb-8" style="color:var(--muted)">Đang khởi tạo...</p>
+      <p class="text-sm mb-6" style="color:var(--muted)">
+        💡 Bạn có thể đóng tab này. Báo cáo sẽ tự lưu khi xong.<br>
+        Mở lại app → vào "Báo cáo đã lưu" để xem kết quả.
+      </p>
+      <button onclick="cancelJob()"
+        class="text-sm px-4 py-2 rounded-lg border"
+        style="border-color:var(--border);color:var(--muted)">
+        Huỷ
+      </button>
     </div>
   </div>
 
