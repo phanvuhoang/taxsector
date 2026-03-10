@@ -363,6 +363,8 @@ QUAN TRỌNG — VĂN BẢN PHÁP LUẬT:
   </tr></thead>
   <tbody>... điền thực tế, ghi rõ nếu văn bản này thay thế văn bản nào ...</tbody>
 </table>
+6. TUYỆT ĐỐI KHÔNG tự thêm số hiệu văn bản (ví dụ: Luật số XX/20XX/QHXX, Nghị định XX/20XX/NĐ-CP) nếu số hiệu đó không xuất hiện rõ ràng trong DỮ LIỆU NGHIÊN CỨU bên dưới.
+7. Nếu không có số hiệu cụ thể trong dữ liệu → chỉ ghi tên loại văn bản chung (ví dụ: "Luật Thuế TNDN hiện hành") thay vì bịa số hiệu.
 """
 
     return f"""Bạn là chuyên gia thuế Big 4 (Deloitte/PwC/EY/KPMG) viết báo cáo phân tích thuế chuyên nghiệp bằng tiếng Việt.
@@ -372,7 +374,7 @@ Viết PHẦN {num}: "{title}" trong báo cáo phân tích về {mode_ctx}: **{s
 Các chủ đề bắt buộc đề cập:
 {sub_list}
 {table_block}
-DỮ LIỆU NGHIÊN CỨU (dùng thông tin này, bổ sung thêm kiến thức của bạn):
+DỮ LIỆU NGHIÊN CỨU (CHỈ dùng thông tin có trong phần này):
 {context}
 
 YÊU CẦU TUYỆT ĐỐI:
@@ -387,6 +389,8 @@ YÊU CẦU TUYỆT ĐỐI:
    - Nếu không có URL cụ thể cho câu đó → dùng URL tổng quát của nguồn
    - KHÔNG viết [N] mà không có thẻ <a href=...>
    - KHÔNG gộp nhiều câu dùng chung 1 citation số
+   - KHÔNG gán citation cho thông tin không có trong dữ liệu nghiên cứu
+   - Nếu không có URL phù hợp → KHÔNG trích dẫn, thay vào đó ghi "(nguồn: chưa xác minh)"
    Ví dụ đúng: Thuế GTGT hiện hành là 10%.<a href="https://thuvienphapluat.vn/van-ban/..." target="_blank" rel="noopener">[1]</a>
    Ví dụ sai: Thuế GTGT hiện hành là 10%.[1] hoặc [1] không có href
 6. Tối thiểu 700 từ — đầy đủ, không rút gọn
@@ -613,6 +617,7 @@ async def stream_report(request: Request, _user: str = Depends(auth)):
                 full_html_with_refs = full_html + refs_html
             else:
                 full_html_with_refs = full_html
+            full_html_with_refs = await verify_legal_refs(full_html_with_refs)
             filename = save_report(subject, full_html_with_refs)
         except Exception:
             filename = None
@@ -705,6 +710,44 @@ def delete_report(name: str, _user: str = Depends(auth)):
 def normalize_text(text: str) -> str:
     """NFC normalize để fix lỗi latin-1 encoding trong python-docx."""
     return unicodedata.normalize('NFC', text)
+
+
+LEGAL_REF_PATTERN = re.compile(
+    r'\b(\d{1,3}/\d{4}/(?:QH|N\u0110-CP|TT-BTC|TT|NQ|CT|PL|UBTVQH)\w*)\b'
+)
+
+async def verify_legal_refs(html: str) -> str:
+    """
+    Scan HTML báo cáo, tìm tất cả số hiệu văn bản pháp luật,
+    query TVPL để check tồn tại. Đánh dấu ⚠️ những cái không tìm thấy.
+    """
+    refs = list(set(LEGAL_REF_PATTERN.findall(html)))
+    if not refs:
+        return html
+
+    unverified = []
+    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+        for ref in refs:
+            try:
+                r = await client.get(
+                    "https://thuvienphapluat.vn/van-ban-phap-luat.aspx",
+                    params={"q": ref, "sbt": "1"},
+                    headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "vi-VN"},
+                )
+                if ref not in r.text and r.status_code == 200:
+                    unverified.append(ref)
+            except Exception:
+                pass  # Network error → skip
+
+    for ref in unverified:
+        html = html.replace(
+            ref,
+            f'<span title="⚠️ Không tìm thấy văn bản này trên thuvienphapluat.vn — cần kiểm tra lại" '
+            f'style="background:#fff3cd;border-bottom:2px solid #f59e0b;cursor:help">'
+            f'⚠️ {ref}</span>'
+        )
+
+    return html
 
 @app.post("/docx")
 async def export_docx(request: Request, _user: str = Depends(auth)):
