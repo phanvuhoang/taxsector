@@ -534,7 +534,7 @@ async def create_gamma_slides(subject: str, html_content: str) -> dict:
         "inputText": f"# {subject}\n\n{plain_text}",
         "textMode": "condense",
         "format": "presentation",
-        "numCards": 60,
+        "numCards": 30,   # Giảm từ 60 → tạo nhanh hơn, đủ nội dung
         "cardSplit": "auto",
         "additionalInstructions": (
             "Phân tích nội dung một cách chi tiết và mạch lạc. "
@@ -579,7 +579,7 @@ async def create_gamma_slides(subject: str, html_content: str) -> dict:
                 raise Exception(f"No generationId in response: {data}")
 
         poll_url = f"{GAMMA_API_URL}/{generation_id}"
-        for _ in range(60):  # max 10 minutes
+        for _ in range(120):  # max 20 minutes (tăng từ 60)
             await asyncio.sleep(10)
             async with session.get(poll_url, headers=headers) as resp:
                 if resp.status != 200:
