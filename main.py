@@ -21,20 +21,26 @@ LEGAL_DB_URL  = "https://raw.githubusercontent.com/phanvuhoang/taxsector/main/le
 
 def load_legal_db() -> list:
     """Load Legal DB từ file local. Download nếu chưa có."""
-    # Try local path first
-    for path in (LEGAL_DB_PATH, Path("legal_db.json")):
+    for path in (
+        Path("/app/data/legal_db.json"),   # Volume mount — ưu tiên trước
+        LEGAL_DB_PATH,                      # /app/legal_db.json (baked in image)
+        Path("legal_db.json"),
+    ):
         if path.exists():
             try:
-                return json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
-                pass
+                data = json.loads(path.read_text(encoding="utf-8"))
+                print(f"[Legal DB] Loaded {len(data)} docs from {path}")
+                return data
+            except Exception as e:
+                print(f"[Legal DB] Error reading {path}: {e}")
     # Fallback: download từ GitHub
     try:
         with urllib.request.urlopen(LEGAL_DB_URL, timeout=10) as r:
-            data = r.read().decode("utf-8")
-        LEGAL_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        LEGAL_DB_PATH.write_text(data, encoding="utf-8")
-        return json.loads(data)
+            data_str = r.read().decode("utf-8")
+        LEGAL_DB_PATH.write_text(data_str, encoding="utf-8")
+        data = json.loads(data_str)
+        print(f"[Legal DB] Downloaded {len(data)} docs from GitHub")
+        return data
     except Exception as e:
         print(f"[WARN] Could not load legal DB: {e}")
         return []
@@ -61,6 +67,17 @@ def build_legal_index(db: list) -> dict:
     return index
 
 LEGAL_INDEX: dict = build_legal_index(LEGAL_DB)
+
+
+def reload_legal_db_from_file():
+    """Reload LEGAL_DB và LEGAL_INDEX từ file. Thread-safe."""
+    global LEGAL_DB, LEGAL_INDEX
+    new_db = load_legal_db()
+    if new_db:
+        LEGAL_DB = new_db
+        LEGAL_INDEX = build_legal_index(new_db)
+        return len(new_db)
+    return 0
 
 
 def normalize_doc_ref(ref: str) -> list:
@@ -1627,6 +1644,23 @@ async def regenerate_section(request: Request, _user: str = Depends(auth)):
 
     return StreamingResponse(generate(), media_type="text/event-stream",
                               headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+# ── Legal DB reload ───────────────────────────────────────────────────────────
+@app.post("/api/reload-legal-db")
+async def reload_legal_db_endpoint(_user: str = Depends(auth)):
+    """Reload Legal DB từ file — dùng khi file được update từ ngoài."""
+    count = reload_legal_db_from_file()
+    expired = sum(
+        1 for d in LEGAL_DB
+        if "hết hiệu lực" in str(d.get("tinh_trang","")).lower()
+        or "het_hieu_luc" in str(d.get("tinh_trang",""))
+    )
+    return {
+        "status": "ok",
+        "docs": count,
+        "expired": expired,
+        "message": f"Reloaded {count} docs ({expired} expired)"
+    }
 
 # ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
