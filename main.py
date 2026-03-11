@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tax Sector Research Tool — Single-file FastAPI application"""
 
-import os, asyncio, json, re, io, secrets, time, unicodedata, uuid, urllib.request
+import os, asyncio, json, re, io, secrets, time, unicodedata, uuid
 from datetime import datetime
 from pathlib import Path
 from typing import AsyncGenerator
@@ -14,121 +14,6 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from docx import Document
 from docx.shared import RGBColor, Pt
 from bs4 import BeautifulSoup
-
-# ── Legal DB ────────────────────────────────────────────────────────────────
-LEGAL_DB_PATH = Path("/app/legal_db.json")
-LEGAL_DB_URL  = "https://raw.githubusercontent.com/phanvuhoang/taxsector/main/legal_db.json"
-
-def load_legal_db() -> list:
-    """Load Legal DB từ file local. Download nếu chưa có."""
-    for path in (
-        Path("/app/data/legal_db.json"),   # Volume mount — ưu tiên trước
-        LEGAL_DB_PATH,                      # /app/legal_db.json (baked in image)
-        Path("legal_db.json"),
-    ):
-        if path.exists():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                print(f"[Legal DB] Loaded {len(data)} docs from {path}")
-                return data
-            except Exception as e:
-                print(f"[Legal DB] Error reading {path}: {e}")
-    # Fallback: download từ GitHub
-    try:
-        with urllib.request.urlopen(LEGAL_DB_URL, timeout=10) as r:
-            data_str = r.read().decode("utf-8")
-        LEGAL_DB_PATH.write_text(data_str, encoding="utf-8")
-        data = json.loads(data_str)
-        print(f"[Legal DB] Downloaded {len(data)} docs from GitHub")
-        return data
-    except Exception as e:
-        print(f"[WARN] Could not load legal DB: {e}")
-        return []
-
-LEGAL_DB: list = load_legal_db()
-
-def build_legal_index(db: list) -> dict:
-    """
-    Build lookup dict: normalized_so_hieu → doc info
-    Key examples: "nd132/2020", "tt80/2021", "luat14/2008"
-    """
-    index = {}
-    for doc in db:
-        so_hieu = doc.get("so_hieu", "")
-        if not so_hieu:
-            continue
-        # Normalize: lowercase, bỏ dấu cách, bỏ ký tự đặc biệt
-        key = re.sub(r'[\s\-/]+', '', so_hieu.lower())
-        index[key] = doc
-        # Thêm key viết tắt: "NĐ 132/2020" → "nđ132/2020" và "nd132/2020"
-        key2 = key.replace('nđ', 'nd').replace('đ', 'd')
-        if key2 != key:
-            index[key2] = doc
-    return index
-
-LEGAL_INDEX: dict = build_legal_index(LEGAL_DB)
-
-
-def reload_legal_db_from_file():
-    """Reload LEGAL_DB và LEGAL_INDEX từ file. Thread-safe."""
-    global LEGAL_DB, LEGAL_INDEX
-    new_db = load_legal_db()
-    if new_db:
-        LEGAL_DB = new_db
-        LEGAL_INDEX = build_legal_index(new_db)
-        return len(new_db)
-    return 0
-
-
-def normalize_doc_ref(ref: str) -> list:
-    """
-    Normalize số hiệu văn bản thành các key có thể lookup trong LEGAL_INDEX.
-    Input:  "Nghị định 132/2020/NĐ-CP" hoặc "NĐ 132/2020" hoặc "132/2020/ND-CP"
-    Output: ["nđ132/2020nđcp", "nd132/2020ndcp", "132/2020", ...]
-    """
-    ref_lower = ref.lower().strip()
-    keys = []
-
-    # Key 1: full normalized
-    keys.append(re.sub(r'[\s\-]+', '', ref_lower))
-
-    # Key 2: chỉ phần số/năm
-    m = re.search(r'(\d+/\d{4})', ref)
-    if m:
-        keys.append(m.group(1))
-
-    # Key 3: viết tắt loại + số/năm
-    abbrevs = {
-        r'ngh[iị]\s*[dđ][iị]nh': 'nd',
-        r'th[oô]ng\s*t[uư]': 'tt',
-        r'quy[eế]t\s*[dđ][iị]nh': 'qd',
-        r'lu[aậ]t': 'luat',
-        r'ngh[iị]\s*quy[eế]t': 'nq',
-        r'ch[iỉ]\s*th[iị]': 'ct',
-        r'c[oô]ng\s*v[aă]n': 'cv',
-    }
-    for pattern, abbr in abbrevs.items():
-        if re.search(pattern, ref_lower):
-            m2 = re.search(r'(\d+/\d{4})', ref)
-            if m2:
-                keys.append(f"{abbr}{m2.group(1).replace('/', '')}")
-            break
-
-    return list(set(keys))
-
-
-def lookup_in_legal_db(ref: str) -> dict | None:
-    """Tìm văn bản trong Legal DB. Trả về doc info hoặc None nếu không tìm thấy."""
-    for key in normalize_doc_ref(ref):
-        key_norm = re.sub(r'[\s\-/]+', '', key.lower())
-        if key_norm in LEGAL_INDEX:
-            return LEGAL_INDEX[key_norm]
-        # Fuzzy: check substring
-        for db_key, doc in LEGAL_INDEX.items():
-            if key_norm in db_key or db_key in key_norm:
-                return doc
-    return None
-
 
 # ── Config ────────────────────────────────────────────────────────────────────
 PERPLEXITY_KEY = os.getenv("PERPLEXITY_API_KEY", "")
@@ -245,21 +130,6 @@ def build_query(section: dict, subject: str, mode: str) -> str:
         f"Nếu có văn bản mới thay thế → bắt buộc dùng văn bản MỚI NHẤT, ghi rõ nó thay thế văn bản nào. "
         f"KHÔNG trích dẫn văn bản đã bị bãi bỏ."
     ) if is_legal else ""
-
-    if is_legal and LEGAL_DB:
-        expired_list = [
-            f"- {d['so_hieu']}: HẾT HIỆU LỰC, thay bởi {d.get('thay_the_boi', d.get('thay_the', ''))}"
-            for d in LEGAL_DB
-            if "HẾT HIỆU LỰC" in d.get("tinh_trang", "").upper()
-        ][:20]
-        if expired_list:
-            expired_text = "\n".join(expired_list)
-            legal_note += f"""
-
-DANH SÁCH VĂN BẢN ĐÃ HẾT HIỆU LỰC — TUYỆT ĐỐI KHÔNG TRÍCH DẪN:
-{expired_text}
-
-Nếu cần đề cập các văn bản trên, PHẢI dùng văn bản thay thế tương ứng."""
 
     return (
         f"Nghiên cứu chuyên sâu về: {section['title']} — {mode_ctx} {subject_ctx} tại Việt Nam năm {current_year}\n"
@@ -1152,33 +1022,15 @@ LEGAL_REF_PATTERN = re.compile(
 async def verify_legal_refs(html: str) -> str:
     """
     Scan HTML báo cáo, tìm tất cả số hiệu văn bản pháp luật,
-    cross-check với Legal DB:
-    - Văn bản HẾT HIỆU LỰC → highlight đỏ + gợi ý thay thế
-    - Văn bản không có trong DB → query TVPL để verify
-    - Văn bản CÒN HIỆU LỰC trong DB → không làm gì
+    query TVPL để check tồn tại. Đánh dấu ⚠️ những cái không tìm thấy.
     """
     refs = list(set(LEGAL_REF_PATTERN.findall(html)))
     if not refs:
         return html
 
-    expired_refs   = {}   # ref → thay_the
-    unverified_refs = []  # ref không có trong DB, cần query TVPL
-
-    for ref in refs:
-        doc = lookup_in_legal_db(ref)
-        if doc:
-            status = doc.get("tinh_trang", "")
-            if "HẾT HIỆU LỰC" in status.upper():
-                replacement = doc.get("thay_the_boi") or doc.get("thay_the", "")
-                note = doc.get("luu_y") or doc.get("ghi_chu", "")
-                expired_refs[ref] = {"replacement": replacement, "note": note}
-            # Còn hiệu lực → OK, bỏ qua
-        else:
-            unverified_refs.append(ref)
-
-    # Query TVPL cho các văn bản không có trong DB
+    unverified = []
     async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
-        for ref in unverified_refs[:10]:  # Giới hạn 10 để tránh chậm
+        for ref in refs:
             try:
                 r = await client.get(
                     "https://thuvienphapluat.vn/van-ban-phap-luat.aspx",
@@ -1186,35 +1038,17 @@ async def verify_legal_refs(html: str) -> str:
                     headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "vi-VN"},
                 )
                 if ref not in r.text and r.status_code == 200:
-                    # Không tìm thấy → mark unverified
-                    expired_refs[ref] = {"replacement": None, "note": "Không tìm thấy trên TVPL"}
+                    unverified.append(ref)
             except Exception:
-                pass
+                pass  # Network error → skip
 
-    # Apply highlights vào HTML
-    for ref, info in expired_refs.items():
-        replacement = info.get("replacement", "")
-        note = info.get("note", "")
-
-        if replacement:
-            tooltip = f"⚠️ Văn bản này đã HẾT HIỆU LỰC. Thay thế bởi: {replacement}. {note}"
-            styled = (
-                f'<span title="{tooltip}" '
-                f'style="background:#fee2e2;border-bottom:2px solid #ef4444;'
-                f'cursor:help;padding:0 2px;border-radius:2px">'
-                f'⚠️ {ref} '
-                f'<small style="color:#ef4444;font-weight:600">'
-                f'[HẾT HIỆU LỰC → xem {replacement}]</small></span>'
-            )
-        else:
-            tooltip = f"⚠️ {note or 'Cần kiểm tra hiệu lực văn bản này'}"
-            styled = (
-                f'<span title="{tooltip}" '
-                f'style="background:#fff3cd;border-bottom:2px solid #f59e0b;'
-                f'cursor:help;padding:0 2px;border-radius:2px">'
-                f'⚠️ {ref}</span>'
-            )
-        html = html.replace(ref, styled, 1)
+    for ref in unverified:
+        html = html.replace(
+            ref,
+            f'<span title="⚠️ Không tìm thấy văn bản này trên thuvienphapluat.vn — cần kiểm tra lại" '
+            f'style="background:#fff3cd;border-bottom:2px solid #f59e0b;cursor:help">'
+            f'⚠️ {ref}</span>'
+        )
 
     return html
 
@@ -1644,23 +1478,6 @@ async def regenerate_section(request: Request, _user: str = Depends(auth)):
 
     return StreamingResponse(generate(), media_type="text/event-stream",
                               headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-
-# ── Legal DB reload ───────────────────────────────────────────────────────────
-@app.post("/api/reload-legal-db")
-async def reload_legal_db_endpoint(_user: str = Depends(auth)):
-    """Reload Legal DB từ file — dùng khi file được update từ ngoài."""
-    count = reload_legal_db_from_file()
-    expired = sum(
-        1 for d in LEGAL_DB
-        if "hết hiệu lực" in str(d.get("tinh_trang","")).lower()
-        or "het_hieu_luc" in str(d.get("tinh_trang",""))
-    )
-    return {
-        "status": "ok",
-        "docs": count,
-        "expired": expired,
-        "message": f"Reloaded {count} docs ({expired} expired)"
-    }
 
 # ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
